@@ -1,6 +1,14 @@
 // ============================================================
-// Mini-Pi v2.1 — iPhone 上的极简本地自主 Agent
+// Mini-Pi v2.2 — iPhone 上的极简本地自主 Agent
 // 运行环境:Scriptable / aBuddy 等 iOS JS 运行时
+//
+// v2.2 修复(多脚本数据隔离):
+//  1. 数据文件绑定脚本名:agent_memory_<脚本名>.json
+//     —— 把同一份代码存成"奥米茄""座天使"等多个脚本时,会话历史各自独立
+//  2. 旧版共用的 agent_memory.json 由第一个运行的脚本自动继承并移除,
+//     其他脚本从空历史开始,不会重复继承
+//  3. AGENT_ID 可手动指定固定数据空间(脚本改名后仍沿用原数据)
+//  4. 抽屉标题、/help、系统提示均显示当前 Agent 名称
 //
 // v2.1 修复(会话隔离与数据安全):
 //  1. 会话 ID 加入随机后缀:同一毫秒创建两个会话不再撞 ID
@@ -48,6 +56,36 @@ const REQUEST_TIMEOUT = 120;  // API 请求超时(秒)
 
 // 技能目录:位于 iCloud 文档目录下,放入 .md 文件即被自动发现
 const SKILLS_DIR = "pi-skills";
+
+// ==========================================
+// 1.1 Agent 身份(多脚本隔离的关键)
+// ==========================================
+// 同一份代码复制成多个脚本(例如"奥米茄"和"座天使")时,如果都用同一个记忆文件,
+// 它们的会话历史就会互相串在一起。这里把数据空间绑定到当前脚本的文件名,自动隔离。
+//   留空 AGENT_ID = 自动使用脚本名(推荐,复制代码即可,无需改动)
+//   填写 AGENT_ID = 手动指定固定名称(适合脚本被改名后仍想沿用原数据)
+const AGENT_ID = "";
+
+function sanitizeAgentName(name) {
+  return String(name || "")
+    .replace(/\.js$/i, "")
+    .replace(/[\/\\:*?"<>|\s]+/g, "_")
+    .slice(0, 40) || "default";
+}
+
+function resolveAgentName() {
+  const manual = String(AGENT_ID || "").trim();
+  if (manual) return sanitizeAgentName(manual);
+  try {
+    if (typeof Script !== "undefined" && Script.name) {
+      const n = Script.name();
+      if (n && String(n).trim()) return sanitizeAgentName(n);
+    }
+  } catch (e) {}
+  return "default";
+}
+
+const AGENT_NAME = resolveAgentName();
 
 // ==========================================
 // 2. 持久化记忆与多会话树 (iCloud 同步)
@@ -132,13 +170,46 @@ function formatShortTime(iso) {
 const MemoryManager = {
   fm: MEM_FM,
 
+  // 每个脚本一份数据文件:同名脚本之间互不干扰
   memoryPath() {
+    return this.fm.joinPath(this.fm.documentsDirectory(), "agent_memory_" + AGENT_NAME + ".json");
+  },
+
+  // v2.1 及更早版本所有脚本共用这一个文件
+  legacyMemoryPath() {
     return this.fm.joinPath(this.fm.documentsDirectory(), "agent_memory.json");
+  },
+
+  // 旧数据迁移:第一个运行的脚本继承旧文件并移除它,避免第二个脚本拿到同一份历史
+  async migrateLegacyMemory(newPath) {
+    try {
+      const legacy = this.legacyMemoryPath();
+      if (legacy === newPath) return;
+      if (!this.fm.fileExists(legacy)) return;
+      if (this.fm.isFileStoredIniCloud && this.fm.isFileStoredIniCloud(legacy) && !this.fm.isFileDownloaded(legacy)) {
+        await this.fm.downloadFileFromiCloud(legacy);
+      }
+      const text = this.fm.readString(legacy);
+      if (text && text.trim()) {
+        this.fm.writeString(newPath, text);
+        try {
+          this.fm.remove(legacy);
+        } catch (e) {
+          // 删除失败也不能让其他脚本重复继承:改写为"已被认领"的空壳
+          try {
+            this.fm.writeString(legacy, JSON.stringify({ claimed_by: AGENT_NAME, claimed_at: new Date().toISOString() }));
+          } catch (e2) {}
+        }
+      }
+    } catch (e) {}
   },
 
   async load() {
     this._lastLoadAt = Date.now();
     const path = this.memoryPath();
+    if (!this.fm.fileExists(path)) {
+      await this.migrateLegacyMemory(path);
+    }
     if (this.fm.fileExists(path)) {
       try {
         if (this.fm.isFileStoredIniCloud && this.fm.isFileStoredIniCloud(path)) {
@@ -344,7 +415,7 @@ const MemoryManager = {
       }
     };
     const text = JSON.stringify(payload, null, 2);
-    const fname = "mini-pi-export-" + (sess.id || Date.now()) + ".json";
+    const fname = "mini-pi-" + AGENT_NAME + "-export-" + (sess.id || Date.now()) + ".json";
     const path = this.fm.joinPath(this.fm.documentsDirectory(), fname);
     this.fm.writeString(path, text);
     Pasteboard.copyString(text);
@@ -1008,6 +1079,7 @@ async function runAgentTurn(prompt, imageBase64 = null, onStatusUpdate = null) {
     {
       role: "system",
       content: `你是一个运行在用户 iPhone 设备上的 Mini-Pi 极简自主 Agent。
+【Agent 名称】：${AGENT_NAME}(与你的记忆、技能绑定,不同名称的脚本数据互相隔离)
 【当前设备时间】：${nowStr}
 【当前模型】：${modelCfg.label}
 【持久化事实知识库】：
@@ -1295,7 +1367,7 @@ function buildChatHTML(mem) {
 
 <div id="history-drawer" class="drawer">
   <div class="drawer-header">
-    <span>历史分支</span>
+    <span>历史分支 · ${escapeHtml(AGENT_NAME)}</span>
     <div class="drawer-actions">
       <button class="action-btn ghost" onclick="postAction('export_session')">导出</button>
       <button class="action-btn ghost" onclick="postAction('import_session')">导入</button>
@@ -1572,6 +1644,7 @@ async function handleSlashCommand(cmd, webView) {
 
   if (c === "/help") {
     await appendAgentMsg(webView,
+      `当前 Agent: ${AGENT_NAME}(数据空间独立)\n` +
       "可用命令:\n" +
       "/model    切换模型\n" +
       "/skills   查看可用技能\n" +
