@@ -1,10 +1,17 @@
 // ============================================================
-// Mini-Pi v2.2 — iPhone 上的极简本地自主 Agent
+// Mini-Pi v2.3 — iPhone 上的极简本地自主 Agent
 // 运行环境:Scriptable / aBuddy 等 iOS JS 运行时
+//
+// v2.3 变更(脚本间存储机制与隐私):
+//  1. 数据文件名清洗策略加固:清洗有损或超长时附加短哈希,
+//     避免两个不同脚本名映射到同一份数据(参考版用 encodeURIComponent
+//     保证唯一但文件名不可读;这里兼顾可读性与唯一性)
+//  2. 新增 /storage 命令:查看当前数据文件名、隔离方式、会话数与共享方法
+//  3. 默认降级位置保持北京市(不含任何真实住址);README 增补隐私与安全章节
 //
 // v2.2 修复(多脚本数据隔离):
 //  1. 数据文件绑定脚本名:agent_memory_<脚本名>.json
-//     —— 把同一份代码存成"奥米茄""座天使"等多个脚本时,会话历史各自独立
+//     —— 把同一份代码存成多个脚本时,各自的会话历史互相独立
 //  2. 旧版共用的 agent_memory.json 由第一个运行的脚本自动继承并移除,
 //     其他脚本从空历史开始,不会重复继承
 //  3. AGENT_ID 可手动指定固定数据空间(脚本改名后仍沿用原数据)
@@ -45,7 +52,7 @@ const MODELS = [
   // { id: "smart", label: "强力模型", url: "https://.../v1/chat/completions", key: "...", model: "..." },
 ];
 
-// 定位失败时的默认降级位置(可按需改为你的常驻地)
+// 定位失败时的默认降级位置(可按需改为你的常驻地,注意不要提交真实住址到公开仓库)
 const DEFAULT_LOCATION = { latitude: 39.9042, longitude: 116.4074, address: "北京市 (默认降级位置)" };
 
 // Agentic 循环与记忆参数
@@ -60,17 +67,35 @@ const SKILLS_DIR = "pi-skills";
 // ==========================================
 // 1.1 Agent 身份(多脚本隔离的关键)
 // ==========================================
-// 同一份代码复制成多个脚本(例如"奥米茄"和"座天使")时,如果都用同一个记忆文件,
+// 同一份代码复制成多个脚本(例如"助手A"和"助手B")时,如果都用同一个记忆文件,
 // 它们的会话历史就会互相串在一起。这里把数据空间绑定到当前脚本的文件名,自动隔离。
 //   留空 AGENT_ID = 自动使用脚本名(推荐,复制代码即可,无需改动)
 //   填写 AGENT_ID = 手动指定固定名称(适合脚本被改名后仍想沿用原数据)
 const AGENT_ID = "";
 
+function shortHash(str) {
+  let h = 5381;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(36).slice(-4);
+}
+
 function sanitizeAgentName(name) {
-  return String(name || "")
-    .replace(/\.js$/i, "")
-    .replace(/[\/\\:*?"<>|\s]+/g, "_")
-    .slice(0, 40) || "default";
+  const raw = String(name || "").trim().replace(/\.js$/i, "");
+  if (!raw) return "default";
+  const cleaned = raw.replace(/[\/\\:*?"<>|\s]+/g, "_").slice(0, 40);
+  if (!cleaned) return "default_" + shortHash(raw);
+  // 清洗有损或超长被截断时附加短哈希:避免两个不同脚本名映射到同一份数据
+  // (参考版用 encodeURIComponent 保证不撞,但文件名不可读;这里兼顾可读性与唯一性)
+  if (cleaned !== raw) return cleaned + "_" + shortHash(raw);
+  return cleaned;
+}
+
+// 数据文件名:全脚本唯一的命名入口
+function memoryFileName() {
+  return "agent_memory_" + AGENT_NAME + ".json";
 }
 
 function resolveAgentName() {
@@ -172,7 +197,7 @@ const MemoryManager = {
 
   // 每个脚本一份数据文件:同名脚本之间互不干扰
   memoryPath() {
-    return this.fm.joinPath(this.fm.documentsDirectory(), "agent_memory_" + AGENT_NAME + ".json");
+    return this.fm.joinPath(this.fm.documentsDirectory(), memoryFileName());
   },
 
   // v2.1 及更早版本所有脚本共用这一个文件
@@ -1651,6 +1676,7 @@ async function handleSlashCommand(cmd, webView) {
       "/skill:名称  启用指定技能\n" +
       "/skill:off   关闭当前技能\n" +
       "/usage    查看 token 用量\n" +
+      "/storage  查看数据存储与脚本隔离信息\n" +
       "/export   导出当前会话(写文件+复制剪贴板)\n" +
       "/import   从剪贴板导入会话 JSON\n" +
       "/new      新建会话\n" +
@@ -1693,6 +1719,19 @@ async function handleSlashCommand(cmd, webView) {
     }
     await MemoryManager.setActiveSkill(sk.name);
     await appendAgentMsg(webView, `已启用技能: ${sk.name}\n${sk.description}\n\n之后的对话将严格遵循该技能说明。输入 /skill:off 关闭。`);
+    return;
+  }
+
+  if (c === "/storage") {
+    const curSess = mem.sessions.find(s => s.id === mem.active_session_id) || mem.sessions[0];
+    const curTurns = Math.floor((((curSess && curSess.messages) || []).length) / 2);
+    await appendAgentMsg(webView,
+      `Agent 名称: ${AGENT_NAME}\n` +
+      `数据文件: ${memoryFileName()}\n` +
+      `存放位置: iCloud 的 Scriptable 文档目录\n` +
+      `隔离方式: 每个脚本一份文件(按脚本名区分),不同脚本互不干扰\n` +
+      `当前状态: 共 ${mem.sessions.length} 个会话,当前会话 ${curTurns} 轮\n` +
+      `共享方式: 两个脚本填写相同的 AGENT_ID 即可共用同一份记忆`);
     return;
   }
 
