@@ -2,17 +2,24 @@
 
 一个运行在 iPhone 脚本运行时（Scriptable / aBuddy 等 JS 环境）上的**极简本地自主 Agent**。单文件即可运行，通过 OpenAI 兼容接口 + Function Calling 驱动，把 AI 能力直接接到 iOS 系统 API 上。
 
+> v2.0 更新：多模型切换、Skills 技能系统、会话导入导出、token 用量统计、摘要式会话压缩、日历事件创建、搜索三通道容灾、渲染安全加固。详见文末 [更新记录](#v20-更新记录)。
+
 ## 功能特性
 
-- 🤖 **Agentic 循环**：最多 8 步工具调用自省推理（ReAct 式状态机）
+- 🤖 **Agentic 循环**：最多 8 步工具调用自省推理（ReAct 式状态机），失败自动重试并回传 HTTP 状态码
 - 🧠 **持久化记忆**：多会话树 + 用户画像 facts，存储于 `agent_memory.json`，支持 iCloud 跨设备同步
+- 🗜️ **摘要式压缩**：对话超过阈值自动调用模型把早期内容压缩为要点摘要，替代粗暴截断
 - 🎨 **AI 生图**：基于 Pollinations 免 Key 图像接口，Markdown 嵌入气泡渲染
-- 🌐 **在线搜索**：DuckDuckGo HTML 抓取，失败自动降级中文维基 API
-- 📍 **定位与天气**：GPS 定位 + 逆地理编码，wttr.in 多语言天气查询
-- 📅 **系统集成**：读写 iOS 日历、创建提醒事项、打开 URL Scheme 跳转 App
+- 🌐 **在线搜索**：三通道容灾（DuckDuckGo HTML → 中文维基 API → DDG Instant Answer）
+- 📍 **定位与天气**：GPS 定位 + 逆地理编码；wttr.in 多语言天气，支持城市名直查，降级坐标可配置
+- 📅 **系统集成**：读写 iOS 日历（查询 + 创建事件）、创建提醒事项、打开 URL Scheme 跳转 App
 - 🖼️ **多模态输入**：支持快捷指令传入截图/照片，Base64 视觉分析
-- ⚡ **SVG 动画渲染**：动态视觉效果直接输出 SMIL/CSS 矢量动画，不依赖外部资源
-- 💬 **原生聊天 UI**：手写 iOS 风格 WebView（气泡、抽屉式会话列表、图片查看器、深色模式）
+- ⚡ **SVG 动画渲染**：动态视觉效果直接输出 SMIL/CSS 矢量动画（渲染前自动清洗脚本与事件处理器）
+- 💬 **原生聊天 UI**：手写 iOS 风格 WebView（气泡、抽屉式会话列表、图片查看器、深色模式、模型选择弹窗）
+- 🔀 **多模型切换**：标题栏模型按钮或 `/model` 命令，随时切换不同端点/模型
+- 🧩 **Skills 技能系统**：`pi-skills` 目录下的 `SKILL.md` 自动注册，`/skill:名称` 启用
+- 📤 **会话导入导出**：`/export` 写文件 + 复制剪贴板，`/import` 从剪贴板恢复
+- 📊 **用量统计**：`/usage` 查看会话与全局 token 消耗
 
 ## 快速开始
 
@@ -25,8 +32,41 @@
    const MODEL   = "<支持 function calling 与视觉的模型名>";
    ```
 
-3. 授予定位、日历、提醒事项、照片权限
-4. 直接运行 → 全屏聊天视图；或从快捷指令传入文本/图片 → Alert 模式返回结果
+   需要多模型时，向 `MODELS` 数组追加条目（可选）：
+
+   ```js
+   const MODELS = [
+     { id: "fast",  label: "快速模型", url: "https://...", key: "...", model: "..." },
+     { id: "smart", label: "强力模型", url: "https://...", key: "...", model: "..." },
+   ];
+   ```
+
+3. （可选）在 iCloud 的 `pi-skills` 目录放入技能文件 `SKILL.md`：
+
+   ```md
+   name: 会议纪要整理
+   description: 把会议记录整理成行动清单
+
+   收到会议记录后，按「事项 / 负责人 / 日期 / 风险」四列输出行动清单，
+   原文没有的信息写"原文未说明"。
+   ```
+
+4. 授予定位、日历、提醒事项、照片权限
+5. 直接运行 → 全屏聊天视图；或从快捷指令传入文本/图片 → Alert 模式返回结果
+
+### 聊天内命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/model` | 切换模型 |
+| `/skills` | 查看可用技能 |
+| `/skill:名称` | 启用指定技能 |
+| `/skill:off` | 关闭当前技能 |
+| `/usage` | 查看 token 用量 |
+| `/export` | 导出当前会话（写文件 + 复制剪贴板） |
+| `/import` | 从剪贴板导入会话 JSON |
+| `/new` / `/clear` | 新建 / 清空会话 |
+| `/help` | 查看全部命令 |
 
 ## 架构
 
@@ -35,23 +75,41 @@
 │  main() 双模态分流                        │
 │  ├─ 模式 A: 快捷指令/共享 → Alert 输出     │
 │  └─ 模式 B: WebView 聊天 UI ←→ 事件轮询   │
+│      └─ 命令面板: /model /skills /usage   │
 ├─────────────────────────────────────────┤
 │  runAgentTurn  Agentic 状态机 (≤8 步)     │
-│    callChatAPI ⇄ executeLocalTool        │
+│    callChatAPI(重试+用量) ⇄ executeTool   │
+│    compactIfNeeded 摘要式压缩             │
 ├─────────────────────────────────────────┤
-│  9 个本地工具: 生图/搜索/定位/坐标/天气/    │
-│  日历/提醒/URL Scheme/记忆写入             │
+│  10 个本地工具: 生图/搜索/定位/坐标/天气/  │
+│  日历查询/日历创建/提醒/URL Scheme/记忆    │
 ├─────────────────────────────────────────┤
 │  MemoryManager (iCloud JSON 持久化)       │
+│  SkillsManager (pi-skills 目录)           │
 └─────────────────────────────────────────┘
 ```
 
 ## 注意事项
 
 - `API_KEY` 请勿提交真实密钥，建议使用运行时占位符并自行替换
-- 定位失败时降级为默认城市坐标（北京），可按需改为你的常驻地
-- 搜索依赖 DuckDuckGo HTML 端点，可能因反爬失效，已内置维基降级通道
+- 定位失败时降级为 `DEFAULT_LOCATION`（默认北京），可按需改为你的常驻地
+- 搜索依赖 DuckDuckGo 端点，可能因反爬失效，已内置维基 + Instant Answer 双降级通道
 - 生图使用 Pollinations 公共服务，不保证 SLA
+- 摘要压缩需要一次额外模型调用；若该次调用失败，自动回退为保留最近 12 轮
+
+## v2.0 更新记录
+
+- 新增 `create_calendar_event` 工具，补齐"读写 iOS 日历"
+- `web_search` 三通道容灾，同时提取标题与链接
+- 天气工具支持城市名直查，内置城市坐标表扩充至 14 城
+- API 调用失败自动重试（网络类错误），HTTP ≥400 带状态码报错
+- token 用量统计：状态栏实时显示 + `/usage` 汇总
+- 摘要式会话压缩（`SUMMARY_TRIGGER` 触发，失败自动回退截断）
+- 多模型切换（`MODELS` 配置 + 标题栏按钮 + `/model` 命令）
+- Skills 技能系统（`pi-skills/SKILL.md`，支持 `name:`/`description:` 元数据）
+- 会话导出/导入（`/export` `/import`，剪贴板 + iCloud 文件）
+- 渲染安全加固：所有文本转义、SVG 清洗（移除 script/事件处理器/javascript: 链接）、图片 URL 白名单
+- 修复图片消息中其余文本未转义的注入隐患
 
 ## License
 
