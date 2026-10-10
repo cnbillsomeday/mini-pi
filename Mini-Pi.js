@@ -1,240 +1,41 @@
 // ============================================================
-// Mini-Pi v2.3 — iPhone 上的极简本地自主 Agent
+// Mini-Pi v3.0 — iPhone 上的极简本地自主 Agent
 // 运行环境:Scriptable / aBuddy 等 iOS JS 运行时
 //
-// v2.3 变更(脚本间存储机制与隐私):
-//  1. 数据文件名清洗策略加固:清洗有损或超长时附加短哈希,
-//     避免两个不同脚本名映射到同一份数据(参考版用 encodeURIComponent
-//     保证唯一但文件名不可读;这里兼顾可读性与唯一性)
-//  2. 新增 /storage 命令:查看当前数据文件名、隔离方式、会话数与共享方法
-//  3. 默认降级位置保持北京市(不含任何真实住址);README 增补隐私与安全章节
+// 本版本基线(按脚本名物理隔离存储):
+//   - 数据文件 = agent_memory_<脚本名>.json(encodeURIComponent 编码),
+//     同一份代码复制成多个脚本时,会话历史各自独立、互不干扰
+//   - 9 个本地工具:生图 / 搜索 / 定位 / 城市坐标 / 天气 / 日历查询 /
+//     创建提醒 / URL Scheme 跳转 / 记忆写入
+//   - 多会话树 + iCloud 同步 + 自省式 Agent 循环(≤8 步)
+//   - 原生 iOS 风格聊天 WebView(气泡、抽屉式会话列表、图片查看器、深色模式)
 //
-// v2.2 修复(多脚本数据隔离):
-//  1. 数据文件绑定脚本名:agent_memory_<脚本名>.json
-//     —— 把同一份代码存成多个脚本时,各自的会话历史互相独立
-//  2. 旧版共用的 agent_memory.json 由第一个运行的脚本自动继承并移除,
-//     其他脚本从空历史开始,不会重复继承
-//  3. AGENT_ID 可手动指定固定数据空间(脚本改名后仍沿用原数据)
-//  4. 抽屉标题、/help、系统提示均显示当前 Agent 名称
-//
-// v2.1 修复(会话隔离与数据安全):
-//  1. 会话 ID 加入随机后缀:同一毫秒创建两个会话不再撞 ID
-//     (撞 ID 会让抽屉里两条记录指向同一会话,表现为"历史相同")
-//  2. 历史数据自愈:加载时自动为重复/缺失的 ID 重新分配
-//  3. 保存时合并磁盘数据 + 写入串行化:多实例/多设备并发不再互相覆盖
-//  4. 重载界面前保留未处理事件:快速连点不再丢操作
-//  5. 抽屉显示每个会话的对话条数与更新时间,便于分辨
-//  6. 主循环容错:瞬时 JS 错误不再直接关闭界面
-//
-// v2.0 优化(相对 v1):
-//  1. 新增 create_calendar_event 工具(补齐 README 承诺的"读写日历")
-//  2. web_search 三通道容灾(DDG HTML → 中文维基 → DDG Instant Answer)
-//  3. 天气工具支持"城市名直查",定位降级坐标可配置
-//  4. API 调用失败自动重试 + HTTP 状态码报错 + token 用量统计(/usage)
-//  5. 摘要式会话压缩(超长对话自动摘要,替代硬截断)
-//  6. 多模型切换(/model 或标题栏模型按钮)
-//  7. Skills 技能系统(pi-skills 目录下的 SKILL.md)
-//  8. 会话导入/导出(/export /import)+ 命令面板(/help)
-//  9. 渲染安全加固:文本转义、SVG 清洗、图片 URL 白名单
+// 隐私说明:为公开发布,定位降级坐标与内置城市表均使用通用值(北京);
+//           若改为自己的常驻地,请勿把该改动提交到公开仓库。
 // ============================================================
 
 // ==========================================
-// 1. 配置区
+// 1. 配置云端 API 参数
 // ==========================================
-const API_URL = "https://api.openai.com/v1/chat/completions"; // 替换为你的 OpenAI 兼容端点
-const API_KEY = "xxxxxx";                                      // 替换为你的 API Key
-const MODEL   = "mimo-v2.6-flash";                             // 需支持 function calling 与视觉
-
-// 多模型切换(可选):留空数组时自动使用上面三个常量。
-// 追加条目后,聊天界面标题栏的"模型"按钮与 /model 命令可随时切换:
-const MODELS = [
-  // { id: "fast",  label: "快速模型", url: "https://.../v1/chat/completions", key: "...", model: "..." },
-  // { id: "smart", label: "强力模型", url: "https://.../v1/chat/completions", key: "...", model: "..." },
-];
-
-// 定位失败时的默认降级位置(可按需改为你的常驻地,注意不要提交真实住址到公开仓库)
-const DEFAULT_LOCATION = { latitude: 39.9042, longitude: 116.4074, address: "北京市 (默认降级位置)" };
-
-// Agentic 循环与记忆参数
-const MAX_STEPS       = 8;    // 单次任务最大工具调用轮数
-const HISTORY_TURNS   = 12;   // 会话兜底保留的最大轮数(1 轮 = 1 问 1 答)
-const SUMMARY_TRIGGER = 16;   // 会话消息数超过该值触发摘要压缩
-const REQUEST_TIMEOUT = 120;  // API 请求超时(秒)
-
-// 技能目录:位于 iCloud 文档目录下,放入 .md 文件即被自动发现
-const SKILLS_DIR = "pi-skills";
+const API_URL = "https://openai.com/v1/chat/completions"; 
+const API_KEY = "xxx"; 
+const MODEL = "mimo-v2.6-flash"; 
 
 // ==========================================
-// 1.1 Agent 身份(多脚本隔离的关键)
+// 2. Mini-Pi 持久化记忆与多会话树 (按脚本名动态物理隔离)
 // ==========================================
-// 同一份代码复制成多个脚本(例如"助手A"和"助手B")时,如果都用同一个记忆文件,
-// 它们的会话历史就会互相串在一起。这里把数据空间绑定到当前脚本的文件名,自动隔离。
-//   留空 AGENT_ID = 自动使用脚本名(推荐,复制代码即可,无需改动)
-//   填写 AGENT_ID = 手动指定固定名称(适合脚本被改名后仍想沿用原数据)
-const AGENT_ID = "";
-
-function shortHash(str) {
-  let h = 5381;
-  const s = String(str || "");
-  for (let i = 0; i < s.length; i++) {
-    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
-  }
-  return h.toString(36).slice(-4);
-}
-
-function sanitizeAgentName(name) {
-  const raw = String(name || "").trim().replace(/\.js$/i, "");
-  if (!raw) return "default";
-  const cleaned = raw.replace(/[\/\\:*?"<>|\s]+/g, "_").slice(0, 40);
-  if (!cleaned) return "default_" + shortHash(raw);
-  // 清洗有损或超长被截断时附加短哈希:避免两个不同脚本名映射到同一份数据
-  // (参考版用 encodeURIComponent 保证不撞,但文件名不可读;这里兼顾可读性与唯一性)
-  if (cleaned !== raw) return cleaned + "_" + shortHash(raw);
-  return cleaned;
-}
-
-// 数据文件名:全脚本唯一的命名入口
-function memoryFileName() {
-  return "agent_memory_" + AGENT_NAME + ".json";
-}
-
-function resolveAgentName() {
-  const manual = String(AGENT_ID || "").trim();
-  if (manual) return sanitizeAgentName(manual);
-  try {
-    if (typeof Script !== "undefined" && Script.name) {
-      const n = Script.name();
-      if (n && String(n).trim()) return sanitizeAgentName(n);
-    }
-  } catch (e) {}
-  return "default";
-}
-
-const AGENT_NAME = resolveAgentName();
-
-// ==========================================
-// 2. 持久化记忆与多会话树 (iCloud 同步)
-// ==========================================
-const MEM_FM = FileManager.iCloud() || FileManager.local();
-
-function jsLiteral(v) {
-  // 把任意值安全地内嵌进 evaluateJavaScript 的代码字符串
-  return JSON.stringify(v).replace(/</g, "\\u003c");
-}
-
-// 会话 ID 生成:毫秒时间戳 + 随机后缀,避免同一毫秒内创建两个会话时 ID 撞车
-// (撞车会导致抽屉里出现两条记录指向同一个会话,看起来"历史相同")
-function newSessionId(takenIds) {
-  const taken = takenIds instanceof Set ? takenIds : new Set(takenIds || []);
-  let id;
-  do {
-    id = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
-  } while (taken.has(id));
-  return id;
-}
-
-// 历史数据自愈:为重复/缺失的 ID 重新分配,保留各自的独立消息
-function repairDuplicateIds(sessions) {
-  const seen = new Set();
-  const allIds = new Set();
-  for (const s of sessions) {
-    if (s && typeof s === "object" && s.id) allIds.add(s.id);
-  }
-  let changed = false;
-  for (const s of sessions) {
-    if (!s || typeof s !== "object") continue;
-    if (!s.id || seen.has(s.id)) {
-      const taken = new Set([...seen, ...allIds]);
-      s.id = newSessionId(taken);
-      allIds.add(s.id);
-      changed = true;
-    }
-    seen.add(s.id);
-  }
-  return changed;
-}
-
-// 保存时合并磁盘数据:内存里没有、但磁盘上更新的会话(其他实例/其他设备创建的)予以保留
-function mergeSessions(memSessions, diskSessions, lastLoadAt) {
-  const merged = memSessions.slice();
-  const pos = new Map();
-  merged.forEach((s, i) => pos.set(s.id, i));
-  for (const ds of diskSessions || []) {
-    if (!ds || !ds.id) continue;
-    if (!pos.has(ds.id)) {
-      // 内存中不存在:比本次加载更新 = 别处新建的,保留;更旧 = 本实例已删除,丢弃
-      const ts = Date.parse(ds.updated_at || ds.created_at || "") || 0;
-      if (ts > lastLoadAt) {
-        merged.unshift(ds);
-        merged.forEach((s, i) => pos.set(s.id, i));
-      }
-      continue;
-    }
-    // 两边都有:取更新时间较新的版本
-    const idx = pos.get(ds.id);
-    const memTs = Date.parse(merged[idx].updated_at || merged[idx].created_at || "") || 0;
-    const diskTs = Date.parse(ds.updated_at || ds.created_at || "") || 0;
-    if (diskTs > memTs) merged[idx] = ds;
-  }
-  return merged;
-}
-
-function formatShortTime(iso) {
-  const t = Date.parse(iso || "");
-  if (!t) return "";
-  const d = new Date(t);
-  const now = new Date();
-  const pad = n => (n < 10 ? "0" + n : String(n));
-  const sameDay = d.getFullYear() === now.getFullYear()
-    && d.getMonth() === now.getMonth()
-    && d.getDate() === now.getDate();
-  return sameDay ? `${pad(d.getHours())}:${pad(d.getMinutes())}`
-                 : `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
 const MemoryManager = {
-  fm: MEM_FM,
+  fm: FileManager.iCloud() ? FileManager.iCloud() : FileManager.local(),
 
-  // 每个脚本一份数据文件:同名脚本之间互不干扰
   memoryPath() {
-    return this.fm.joinPath(this.fm.documentsDirectory(), memoryFileName());
-  },
-
-  // v2.1 及更早版本所有脚本共用这一个文件
-  legacyMemoryPath() {
-    return this.fm.joinPath(this.fm.documentsDirectory(), "agent_memory.json");
-  },
-
-  // 旧数据迁移:第一个运行的脚本继承旧文件并移除它,避免第二个脚本拿到同一份历史
-  async migrateLegacyMemory(newPath) {
-    try {
-      const legacy = this.legacyMemoryPath();
-      if (legacy === newPath) return;
-      if (!this.fm.fileExists(legacy)) return;
-      if (this.fm.isFileStoredIniCloud && this.fm.isFileStoredIniCloud(legacy) && !this.fm.isFileDownloaded(legacy)) {
-        await this.fm.downloadFileFromiCloud(legacy);
-      }
-      const text = this.fm.readString(legacy);
-      if (text && text.trim()) {
-        this.fm.writeString(newPath, text);
-        try {
-          this.fm.remove(legacy);
-        } catch (e) {
-          // 删除失败也不能让其他脚本重复继承:改写为"已被认领"的空壳
-          try {
-            this.fm.writeString(legacy, JSON.stringify({ claimed_by: AGENT_NAME, claimed_at: new Date().toISOString() }));
-          } catch (e2) {}
-        }
-      }
-    } catch (e) {}
+    const scriptName = (typeof Script !== "undefined" && Script.name()) 
+      ? encodeURIComponent(Script.name()) 
+      : "default";
+    return this.fm.joinPath(this.fm.documentsDirectory(), `agent_memory_${scriptName}.json`);
   },
 
   async load() {
-    this._lastLoadAt = Date.now();
     const path = this.memoryPath();
-    if (!this.fm.fileExists(path)) {
-      await this.migrateLegacyMemory(path);
-    }
     if (this.fm.fileExists(path)) {
       try {
         if (this.fm.isFileStoredIniCloud && this.fm.isFileStoredIniCloud(path)) {
@@ -244,59 +45,26 @@ const MemoryManager = {
         }
         const data = JSON.parse(this.fm.readString(path));
         if (!data.sessions || data.sessions.length === 0) {
-          const initId = newSessionId();
-          const nowIso = new Date().toISOString();
-          data.sessions = [{ id: initId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }];
+          const initId = "sess_" + Date.now();
+          data.sessions = [{ id: initId, title: "新会话", created_at: new Date().toISOString(), messages: [] }];
           data.active_session_id = initId;
         }
         if (!data.user_profile) data.user_profile = { facts: [] };
-        if (!data.usage) data.usage = { global: { prompt: 0, completion: 0 }, by_session: {} };
-        if (!data.settings) data.settings = {};
-        // 自愈历史数据:修复重复/缺失的会话 ID(否则两条记录会指向同一份历史)
-        if (repairDuplicateIds(data.sessions)) {
-          try {
-            this.fm.writeString(path, JSON.stringify(data, null, 2));
-          } catch (e) {}
-        }
         return data;
       } catch (e) {}
     }
-    const initId = newSessionId();
-    const nowIso = new Date().toISOString();
+    const initId = "sess_" + Date.now();
     return {
       user_profile: { facts: [] },
       active_session_id: initId,
-      settings: {},
-      usage: { global: { prompt: 0, completion: 0 }, by_session: {} },
       sessions: [
-        { id: initId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }
+        { id: initId, title: "新会话", created_at: new Date().toISOString(), messages: [] }
       ]
     };
   },
 
-  // 写入串行化 + 合并磁盘上的新数据,避免两个实例/两台设备互相覆盖
   async save(data) {
-    const doWrite = async () => {
-      try {
-        const path = this.memoryPath();
-        if (this.fm.fileExists(path) && this._lastLoadAt) {
-          const diskData = JSON.parse(this.fm.readString(path));
-          if (diskData && Array.isArray(diskData.sessions)) {
-            data.sessions = mergeSessions(data.sessions || [], diskData.sessions, this._lastLoadAt);
-          }
-          // 用量取较大值:既不丢失别处的计数,也不会因重复保存而翻倍
-          if (diskData && diskData.usage && data.usage) {
-            const dg = diskData.usage.global || { prompt: 0, completion: 0 };
-            data.usage.global = data.usage.global || { prompt: 0, completion: 0 };
-            data.usage.global.prompt = Math.max(data.usage.global.prompt || 0, dg.prompt || 0);
-            data.usage.global.completion = Math.max(data.usage.global.completion || 0, dg.completion || 0);
-          }
-        }
-      } catch (e) {}
-      this.fm.writeString(this.memoryPath(), JSON.stringify(data, null, 2));
-    };
-    this._saveChain = (this._saveChain || Promise.resolve()).then(doWrite, doWrite);
-    return this._saveChain;
+    this.fm.writeString(this.memoryPath(), JSON.stringify(data, null, 2));
   },
 
   async appendFact(fact) {
@@ -328,13 +96,11 @@ const MemoryManager = {
 
   async createNewSession() {
     const mem = await this.load();
-    const nowIso = new Date().toISOString();
-    const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
+    const newId = "sess_" + Date.now();
     const newSession = {
       id: newId,
       title: "新会话",
-      created_at: nowIso,
-      updated_at: nowIso,
+      created_at: new Date().toISOString(),
       messages: []
     };
     mem.sessions.unshift(newSession);
@@ -347,9 +113,8 @@ const MemoryManager = {
     const mem = await this.load();
     mem.sessions = mem.sessions.filter(s => s.id !== sessionId);
     if (mem.sessions.length === 0) {
-      const nowIso = new Date().toISOString();
-      const newId = newSessionId();
-      mem.sessions = [{ id: newId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }];
+      const newId = "sess_" + Date.now();
+      mem.sessions = [{ id: newId, title: "新会话", created_at: new Date().toISOString(), messages: [] }];
       mem.active_session_id = newId;
     } else if (mem.active_session_id === sessionId) {
       mem.active_session_id = mem.sessions[0].id;
@@ -357,13 +122,12 @@ const MemoryManager = {
     await this.save(mem);
   },
 
-  async appendTurn(userPrompt, assistantReply) {
+  async appendTurn(userPrompt, assistantReply, maxTurns = 8) {
     const mem = await this.load();
     let sess = mem.sessions.find(s => s.id === mem.active_session_id);
     if (!sess) {
-      const nowIso = new Date().toISOString();
-      const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
-      sess = { id: newId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] };
+      const newId = "sess_" + Date.now();
+      sess = { id: newId, title: "新会话", created_at: new Date().toISOString(), messages: [] };
       mem.sessions.unshift(sess);
       mem.active_session_id = newId;
     }
@@ -374,12 +138,9 @@ const MemoryManager = {
 
     sess.messages.push({ role: "user", content: String(userPrompt) });
     sess.messages.push({ role: "assistant", content: String(assistantReply) });
-    sess.updated_at = new Date().toISOString();
 
-    // 兜底截断(正常情况下已由摘要压缩处理,见 compactIfNeeded)
-    const cap = HISTORY_TURNS * 2;
-    if (sess.messages.length > cap) {
-      sess.messages = sess.messages.slice(-cap);
+    if (sess.messages.length > maxTurns * 2) {
+      sess.messages = sess.messages.slice(-maxTurns * 2);
     }
     await this.save(mem);
   },
@@ -390,143 +151,13 @@ const MemoryManager = {
     if (sess) {
       sess.messages = [];
       sess.title = "新会话";
-      sess.updated_at = new Date().toISOString();
-      delete sess.summary;
       await this.save(mem);
     }
-  },
-
-  async addUsage(sessionId, usage) {
-    if (!usage) return;
-    const mem = await this.load();
-    mem.usage = mem.usage || { global: { prompt: 0, completion: 0 }, by_session: {} };
-    mem.usage.global = mem.usage.global || { prompt: 0, completion: 0 };
-    mem.usage.by_session = mem.usage.by_session || {};
-    const bs = mem.usage.by_session[sessionId] || { prompt: 0, completion: 0 };
-    bs.prompt += usage.prompt || 0;
-    bs.completion += usage.completion || 0;
-    mem.usage.by_session[sessionId] = bs;
-    mem.usage.global.prompt += usage.prompt || 0;
-    mem.usage.global.completion += usage.completion || 0;
-    await this.save(mem);
-  },
-
-  async setModel(modelId) {
-    const mem = await this.load();
-    mem.settings = mem.settings || {};
-    mem.settings.model_id = modelId;
-    await this.save(mem);
-  },
-
-  async setActiveSkill(skillName) {
-    const mem = await this.load();
-    mem.settings = mem.settings || {};
-    if (skillName) mem.settings.active_skill = skillName;
-    else delete mem.settings.active_skill;
-    await this.save(mem);
-  },
-
-  async exportSession(sessionId) {
-    const mem = await this.load();
-    const sess = mem.sessions.find(s => s.id === sessionId) || mem.sessions[0];
-    const payload = {
-      app: "Mini-Pi",
-      version: 2,
-      exported_at: new Date().toISOString(),
-      session: {
-        title: sess.title,
-        summary: sess.summary || "",
-        messages: sess.messages || []
-      }
-    };
-    const text = JSON.stringify(payload, null, 2);
-    const fname = "mini-pi-" + AGENT_NAME + "-export-" + (sess.id || Date.now()) + ".json";
-    const path = this.fm.joinPath(this.fm.documentsDirectory(), fname);
-    this.fm.writeString(path, text);
-    Pasteboard.copyString(text);
-    return { path, fname, turns: Math.floor((sess.messages || []).length / 2) };
-  },
-
-  async importSession(jsonText) {
-    let payload;
-    try {
-      payload = JSON.parse(jsonText);
-    } catch (e) {
-      throw new Error("剪贴板内容不是有效 JSON");
-    }
-    const sess = (payload && payload.session) || (payload && payload.sessions && payload.sessions[0]) || payload;
-    if (!sess || !Array.isArray(sess.messages)) {
-      throw new Error("JSON 中没有可导入的会话(messages 缺失)");
-    }
-    const mem = await this.load();
-    const nowIso = new Date().toISOString();
-    const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
-    const copy = {
-      id: newId,
-      title: sess.title || "导入会话",
-      created_at: nowIso,
-      updated_at: nowIso,
-      summary: sess.summary || "",
-      messages: sess.messages.slice(-HISTORY_TURNS * 2)
-    };
-    mem.sessions.unshift(copy);
-    mem.active_session_id = newId;
-    await this.save(mem);
-    return copy;
   }
 };
 
 // ==========================================
-// 3. Skills 技能系统 (pi-skills 目录)
-// ==========================================
-function parseSkill(raw) {
-  const text = String(raw || "");
-  const nameM = text.match(/^name:\s*(.+)$/m);
-  const descM = text.match(/^description:\s*(.+)$/m);
-  const body = text.replace(/^---[\s\S]*?---\s*/, "").trim();
-  return {
-    name: (nameM ? nameM[1] : "未命名技能").trim(),
-    description: (descM ? descM[1] : (body.slice(0, 80) || "无描述")).trim(),
-    content: body || text.trim()
-  };
-}
-
-const SkillsManager = {
-  skillsDir() {
-    return MemoryManager.fm.joinPath(MemoryManager.fm.documentsDirectory(), SKILLS_DIR);
-  },
-
-  async listSkills() {
-    const out = [];
-    try {
-      const dir = this.skillsDir();
-      if (!MemoryManager.fm.fileExists(dir)) return out;
-      const names = MemoryManager.fm.listContents(dir);
-      for (const n of names) {
-        const name = String(n);
-        if (!name.toLowerCase().endsWith(".md")) continue;
-        const p = MemoryManager.fm.joinPath(dir, name);
-        const raw = MemoryManager.fm.readString(p);
-        const meta = parseSkill(raw);
-        out.push({ file: name, name: meta.name, description: meta.description, content: meta.content });
-      }
-    } catch (e) {}
-    return out;
-  },
-
-  async loadSkill(skillName) {
-    const list = await this.listSkills();
-    const target = String(skillName || "").trim().toLowerCase();
-    return list.find(s =>
-      s.name.toLowerCase() === target ||
-      s.name.toLowerCase().includes(target) ||
-      s.file.toLowerCase().replace(/\.md$/, "") === target
-    ) || null;
-  }
-};
-
-// ==========================================
-// 4. 工具集定义 (10 个本地工具)
+// 3. Mini-Pi 工具集 (含 AI 生图与在线搜索)
 // ==========================================
 const tools = [
   {
@@ -549,7 +180,7 @@ const tools = [
     type: "function",
     function: {
       name: "web_search",
-      description: "在互联网上实时搜索最新资讯、新闻、技术资料或专业解答，多通道容灾",
+      description: "在互联网上实时搜索最新资讯、新闻、技术资料或专业解答",
       parameters: {
         type: "object",
         properties: {
@@ -585,15 +216,15 @@ const tools = [
     type: "function",
     function: {
       name: "get_weather_by_coords",
-      description: "查询实时天气（气温、体感、湿度、降水等）。提供经纬度或城市名之一即可，两者都缺省时使用默认位置",
+      description: "根据经纬度或城市名查询实时天气（气温、体感、湿度、降水等），内置多通道防阻断容灾",
       parameters: {
         type: "object",
         properties: {
-          latitude: { type: "number", description: "纬度（可选，与城市名二选一）" },
-          longitude: { type: "number", description: "经度（可选，与城市名二选一）" },
-          city_name: { type: "string", description: "城市或区县名称（可选，与经纬度二选一）" }
+          latitude: { type: "number", description: "纬度" },
+          longitude: { type: "number", description: "经度" },
+          city_name: { type: "string", description: "城市或区县名称" }
         },
-        required: []
+        required: ["latitude", "longitude"]
       }
     }
   },
@@ -608,25 +239,6 @@ const tools = [
           days_ahead: { type: "integer", description: "查询往后多少天，默认 1" }
         },
         required: ["days_ahead"]
-      }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "create_calendar_event",
-      description: "在 iOS 系统日历中创建日程事件",
-      parameters: {
-        type: "object",
-        properties: {
-          title: { type: "string", description: "事件标题" },
-          start_date: { type: "string", description: "开始时间，ISO 8601 格式" },
-          end_date: { type: "string", description: "结束时间，ISO 8601 格式，默认开始后 1 小时" },
-          location: { type: "string", description: "地点（可选）" },
-          notes: { type: "string", description: "备注（可选）" },
-          all_day: { type: "boolean", description: "是否全天事件，默认 false" }
-        },
-        required: ["title", "start_date"]
       }
     }
   },
@@ -677,45 +289,8 @@ const tools = [
 ];
 
 // ==========================================
-// 5. 工具执行器 (Local Executor)
+// 4. 工具执行器 (Local Executor)
 // ==========================================
-function stripHtml(s) {
-  return String(s || "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#x27;|&#39;/g, "'")
-    .trim();
-}
-
-const CITY_MAP = {
-  "成都": { latitude: 30.57, longitude: 104.07, city_name: "成都市" },
-  "武汉": { latitude: 30.59, longitude: 114.31, city_name: "武汉市" },
-  "西安": { latitude: 34.34, longitude: 108.94, city_name: "西安市" },
-  "东莞": { latitude: 23.02, longitude: 113.75, city_name: "东莞市" },
-  "广州": { latitude: 23.13, longitude: 113.26, city_name: "广州市" },
-  "深圳": { latitude: 22.54, longitude: 114.06, city_name: "深圳市" },
-  "北京": { latitude: 39.90, longitude: 116.40, city_name: "北京市" },
-  "上海": { latitude: 31.23, longitude: 121.47, city_name: "上海市" },
-  "杭州": { latitude: 30.27, longitude: 120.15, city_name: "杭州市" },
-  "南京": { latitude: 32.06, longitude: 118.80, city_name: "南京市" },
-  "重庆": { latitude: 29.56, longitude: 106.55, city_name: "重庆市" },
-  "苏州": { latitude: 31.30, longitude: 120.62, city_name: "苏州市" },
-  "天津": { latitude: 39.08, longitude: 117.20, city_name: "天津市" },
-  "长沙": { latitude: 28.23, longitude: 112.94, city_name: "长沙市" }
-};
-
-function coordsForCity(name) {
-  const raw = String(name || "").trim();
-  if (!raw) return null;
-  for (const k of Object.keys(CITY_MAP)) {
-    if (raw.includes(k)) return CITY_MAP[k];
-  }
-  return null;
-}
-
 async function executeLocalTool(name, args, onStatusUpdate = null) {
   console.log(`[Mini-Pi Action] 执行: ${name}`);
   if (onStatusUpdate) await onStatusUpdate(`调用技能: ${name}...`);
@@ -738,8 +313,6 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
     if (name === "web_search") {
       const query = (args.query || "").trim();
       const results = [];
-
-      // 通道 1: DuckDuckGo HTML(标题 + 链接 + 摘要,分别匹配两类节点)
       try {
         const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
         const req = new Request(searchUrl);
@@ -748,27 +321,14 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
           "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
         };
         const html = await req.loadString();
-        const titleRe = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-        const snipRe = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
-        const titles = [];
-        const snippets = [];
-        let m;
-        while ((m = titleRe.exec(html)) !== null && titles.length < 5) {
-          titles.push({ title: stripHtml(m[2]), url: m[1] });
-        }
-        while ((m = snipRe.exec(html)) !== null && snippets.length < 5) {
-          const s = stripHtml(m[1]);
-          if (s) snippets.push(s);
-        }
-        for (let i = 0; i < Math.min(titles.length, snippets.length); i++) {
-          results.push({ title: titles[i].title, url: titles[i].url, snippet: snippets[i] });
-        }
-        if (results.length === 0 && snippets.length > 0) {
-          for (const s of snippets) results.push({ snippet: s });
+        const regex = /<a class="result__snippet[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+        let match;
+        while ((match = regex.exec(html)) !== null && results.length < 5) {
+          const rawText = match[2].replace(/<[^>]+>/g, "").trim();
+          if (rawText) results.push({ snippet: rawText });
         }
       } catch (e) {}
 
-      // 通道 2: 中文维基 API
       if (results.length === 0) {
         try {
           const wikiUrl = `https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json`;
@@ -779,33 +339,13 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
             for (const item of wData.query.search.slice(0, 4)) {
               results.push({
                 title: item.title,
-                snippet: stripHtml(item.snippet)
+                snippet: item.snippet.replace(/<[^>]+>/g, "").trim()
               });
             }
           }
         } catch (e) {}
       }
-
-      // 通道 3: DuckDuckGo Instant Answer API
-      if (results.length === 0) {
-        try {
-          const iaReq = new Request(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`);
-          iaReq.timeoutInterval = 6;
-          const ia = await iaReq.loadJSON();
-          if (ia && ia.AbstractText) {
-            results.push({ title: ia.Heading || "摘要", snippet: ia.AbstractText, url: ia.AbstractURL || "" });
-          }
-          if (results.length === 0 && ia && ia.RelatedTopics && ia.RelatedTopics.length) {
-            for (const t of ia.RelatedTopics.slice(0, 3)) {
-              if (t && t.Text) results.push({ snippet: t.Text });
-            }
-          }
-        } catch (e) {}
-      }
-
-      return results.length > 0
-        ? { query, results }
-        : { query, note: "未获取到外部搜索结果，建议换更短的关键词重试。" };
+      return results.length > 0 ? { query, results } : { query, note: "未获取到外部搜索结果" };
     }
 
     if (name === "get_current_location") {
@@ -824,47 +364,40 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
         } catch (e) {}
         return { latitude: loc.latitude, longitude: loc.longitude, address: addressDesc };
       } catch (err) {
-        return {
-          latitude: DEFAULT_LOCATION.latitude,
-          longitude: DEFAULT_LOCATION.longitude,
-          address: DEFAULT_LOCATION.address
-        };
+        return { latitude: 39.90, longitude: 116.40, address: "北京市 (默认降级位置)" };
       }
     }
 
     if (name === "search_city_coords") {
-      const raw = (args.city_name || "").trim();
-      const hit = coordsForCity(raw);
-      return hit || {
-        latitude: DEFAULT_LOCATION.latitude,
-        longitude: DEFAULT_LOCATION.longitude,
-        city_name: raw || DEFAULT_LOCATION.address
+      const cityMap = {
+        "成都": { latitude: 30.57, longitude: 104.07, city_name: "成都市" },
+        "武汉": { latitude: 30.59, longitude: 114.31, city_name: "武汉市" },
+        "西安": { latitude: 34.34, longitude: 108.94, city_name: "西安市" },
+        "东莞": { latitude: 23.02, longitude: 113.75, city_name: "东莞市" },
+        "广州": { latitude: 23.13, longitude: 113.26, city_name: "广州市" },
+        "深圳": { latitude: 22.54, longitude: 114.06, city_name: "深圳市" },
+        "北京": { latitude: 39.90, longitude: 116.40, city_name: "北京市" },
+        "上海": { latitude: 31.23, longitude: 121.47, city_name: "上海市" },
+        "杭州": { latitude: 30.27, longitude: 120.15, city_name: "杭州市" }
       };
+      const raw = (args.city_name || "").trim();
+      for (const [k, v] of Object.entries(cityMap)) {
+        if (raw.includes(k)) return v;
+      }
+      return { latitude: 39.90, longitude: 116.40, city_name: raw || "当前地区" };
     }
 
     if (name === "get_weather_by_coords") {
-      let lat = args.latitude;
-      let lon = args.longitude;
-      const cityName = args.city_name || "";
-      if (typeof lat !== "number" || typeof lon !== "number" || isNaN(lat) || isNaN(lon)) {
-        const hit = cityName ? coordsForCity(cityName) : null;
-        if (hit) {
-          lat = hit.latitude;
-          lon = hit.longitude;
-        } else {
-          lat = DEFAULT_LOCATION.latitude;
-          lon = DEFAULT_LOCATION.longitude;
-        }
-      }
+      const cityName = args.city_name || "当地";
       try {
-        const wttrUrl = `https://wttr.in/${lat},${lon}?format=j1&lang=zh`;
+        const wttrUrl = `https://wttr.in/${args.latitude},${args.longitude}?format=j1&lang=zh`;
         const reqWttr = new Request(wttrUrl);
         reqWttr.timeoutInterval = 8;
         reqWttr.headers = { "User-Agent": "curl/7.88.1" };
         const data = await reqWttr.loadJSON();
         const cur = data.current_condition[0];
         return {
-          location: cityName || "当地",
+          location: cityName,
           weather: cur.lang_zh ? cur.lang_zh[0].value : cur.weatherDesc[0].value,
           temperature: `${cur.temp_C} °C`,
           apparent_temperature: `${cur.FeelsLikeC} °C`,
@@ -873,7 +406,7 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
           precipitation: `${cur.precipMM} mm`
         };
       } catch (e) {
-        return { location: cityName || "当地", note: "接口受阻，已提供快捷跳转", suggest_url: "weather://" };
+        return { location: cityName, note: "接口受阻，已提供快捷跳转", suggest_url: "weather://" };
       }
     }
 
@@ -887,26 +420,6 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
         endDate: e.endDate ? e.endDate.toISOString() : null,
         notes: e.notes
       }));
-    }
-
-    if (name === "create_calendar_event") {
-      const cal = await Calendar.defaultForEvents();
-      if (!cal) throw new Error("未找到默认日历");
-      const startDate = new Date(args.start_date);
-      if (isNaN(startDate.getTime())) throw new Error("开始时间无效: " + args.start_date);
-      const evt = new CalendarEvent();
-      evt.calendar = cal;
-      evt.title = args.title;
-      evt.startDate = startDate;
-      evt.endDate = args.end_date
-        ? new Date(args.end_date)
-        : new Date(startDate.getTime() + 60 * 60 * 1000);
-      if (isNaN(evt.endDate.getTime())) throw new Error("结束时间无效: " + args.end_date);
-      if (args.location) evt.location = args.location;
-      if (args.notes) evt.notes = args.notes;
-      if (args.all_day) evt.isAllDay = true;
-      await evt.save();
-      return { success: true, message: `已成功创建日历事件: ${args.title}` };
     }
 
     if (name === "create_reminder") {
@@ -942,146 +455,50 @@ async function executeLocalTool(name, args, onStatusUpdate = null) {
 }
 
 // ==========================================
-// 6. Agentic 执行引擎 (状态机 + 重试 + 用量 + 摘要压缩)
+// 5. Mini-Pi Agentic 执行引擎 (状态机)
 // ==========================================
-function getActiveModels() {
-  if (MODELS && MODELS.length > 0) return MODELS;
-  return [{
-    id: "main",
-    label: MODEL || "默认模型",
-    url: API_URL,
-    key: API_KEY,
-    model: MODEL
-  }];
-}
-
-function getActiveModelCfg(mem) {
-  const list = getActiveModels();
-  const sid = (mem && mem.settings && mem.settings.model_id) || null;
-  return list.find(m => m.id === sid) || list[0];
-}
-
-async function callChatAPIOnce(messages, modelCfg, withTools) {
-  const req = new Request(modelCfg.url);
+async function callChatAPI(messages) {
+  const req = new Request(API_URL);
   req.method = "POST";
-  req.timeoutInterval = REQUEST_TIMEOUT;
+  req.timeoutInterval = 120;
   req.headers = {
     "Content-Type": "application/json",
     "Accept": "application/json",
     "Accept-Encoding": "identity",
-    "Authorization": `Bearer ${String(modelCfg.key || "").trim()}`
+    "Authorization": `Bearer ${API_KEY.trim()}`
   };
 
-  const body = { model: modelCfg.model, messages: messages };
-  if (withTools) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
-  req.body = JSON.stringify(body);
+  req.body = JSON.stringify({
+    model: MODEL,
+    messages: messages,
+    tools: tools,
+    tool_choice: "auto"
+  });
 
   const data = await req.load();
   const raw = data.toRawString();
-  const statusCode = (req.response && req.response.statusCode) || 0;
 
   let resp;
   try {
     resp = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`API 解析失败 (HTTP ${statusCode}): ${raw.slice(0, 120)}`);
+    throw new Error(`API 解析失败: ${raw.slice(0, 100)}`);
   }
 
-  if (statusCode >= 400) {
-    const msg = (resp.error && (resp.error.message || resp.error.code)) || raw.slice(0, 120);
-    throw new Error(`HTTP ${statusCode}: ${msg}`);
-  }
   if (resp.error) throw new Error(resp.error.message || JSON.stringify(resp.error));
   if (!resp.choices || resp.choices.length === 0) throw new Error("API 未返回有效 choices");
 
-  return { message: resp.choices[0].message, usage: resp.usage || null };
-}
-
-async function callChatAPI(messages, modelCfg, withTools = true, maxRetries = 1) {
-  let lastErr = null;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await callChatAPIOnce(messages, modelCfg, withTools);
-    } catch (e) {
-      lastErr = e;
-      const msg = String(e && e.message ? e.message : e);
-      // 网络/超时类错误才重试;鉴权、参数、模型类错误直接抛出
-      const fatal = /HTTP 4\d\d|invalid|unauthorized|api key|not found|model|参数|401|403|404|422/i.test(msg);
-      if (attempt >= maxRetries || fatal) break;
-      await new Promise(r => Timer.schedule(1.2, false, r));
-    }
-  }
-  throw lastErr;
-}
-
-async function summarizeHistory(msgs, modelCfg) {
-  const text = msgs
-    .map(m => (m.role === "user" ? "用户" : "助手") + ": " + String(m.content).slice(0, 1500))
-    .join("\n");
-  const { message } = await callChatAPI([
-    {
-      role: "system",
-      content: "你是会话压缩器。把以下对话压缩成中文要点摘要：保留任务目标、重要结论、待办事项、用户偏好与未解决的问题。不超过 300 字，直接输出摘要本身，不要解释。"
-    },
-    { role: "user", content: text }
-  ], modelCfg, false, 0);
-  return (message && message.content || "").trim();
-}
-
-async function compactIfNeeded(sess, mem) {
-  if (!sess.messages || sess.messages.length <= SUMMARY_TRIGGER) return;
-  const split = Math.floor(sess.messages.length * 0.5);
-  if (split < 2) return;
-  const older = sess.messages.slice(0, split);
-  const newer = sess.messages.slice(split);
-  const modelCfg = getActiveModelCfg(mem);
-  try {
-    const summary = await summarizeHistory(older, modelCfg);
-    if (summary) {
-      sess.summary = summary;
-      sess.messages = newer;
-    } else {
-      sess.messages = sess.messages.slice(-HISTORY_TURNS * 2);
-    }
-  } catch (e) {
-    sess.messages = sess.messages.slice(-HISTORY_TURNS * 2);
-  }
-  await MemoryManager.save(mem);
+  return resp.choices[0].message;
 }
 
 async function runAgentTurn(prompt, imageBase64 = null, onStatusUpdate = null) {
   const nowStr = new Date().toISOString();
   const localMem = await MemoryManager.load();
   const currentSess = await MemoryManager.getActiveSession();
-  const modelCfg = getActiveModelCfg(localMem);
 
-  await compactIfNeeded(currentSess, localMem);
-
-  const knownFacts = localMem.user_profile.facts.length > 0
-    ? localMem.user_profile.facts.join("\n- ")
+  const knownFacts = localMem.user_profile.facts.length > 0 
+    ? localMem.user_profile.facts.join("\n- ") 
     : "暂无持久化事实";
-
-  // 技能索引 + 当前启用技能全文
-  const skills = await SkillsManager.listSkills();
-  const skillIndex = skills.length > 0
-    ? skills.map(s => `- ${s.name}: ${s.description}`).join("\n")
-    : "暂无(将 SKILL.md 放入 iCloud 的 pi-skills 目录即可注册)";
-  let skillBlock = "";
-  const activeSkillName = (localMem.settings && localMem.settings.active_skill) || "";
-  if (activeSkillName) {
-    const sk = await SkillsManager.loadSkill(activeSkillName);
-    if (sk) {
-      skillBlock = `【当前启用技能】${sk.name}\n${sk.content}\n\n请严格遵循该技能的说明完成任务。\n`;
-    } else {
-      skillBlock = `【技能提示】此前启用的技能 "${activeSkillName}" 已不存在，按常规规则继续。\n`;
-    }
-  }
-  const summaryBlock = currentSess.summary
-    ? `【此前对话摘要】\n${currentSess.summary}\n`
-    : "";
 
   let userContent;
   if (imageBase64) {
@@ -1104,17 +521,12 @@ async function runAgentTurn(prompt, imageBase64 = null, onStatusUpdate = null) {
     {
       role: "system",
       content: `你是一个运行在用户 iPhone 设备上的 Mini-Pi 极简自主 Agent。
-【Agent 名称】：${AGENT_NAME}(与你的记忆、技能绑定,不同名称的脚本数据互相隔离)
 【当前设备时间】：${nowStr}
-【当前模型】：${modelCfg.label}
 【持久化事实知识库】：
 - ${knownFacts}
 
-【可用技能】：
-${skillIndex}
-${skillBlock}${summaryBlock}
 【执行规范】：
-1. 涉及"变换形态"、"机械动画"、"特效展示"等交互或动态视觉效果，严禁编造外部图片链接，必须直接输出带有 SMIL/CSS 动画的标准 <svg>...</svg> 矢量代码。
+1. 涉及“变换形态”、“机械动画”、“特效展示”等交互或动态视觉效果，严禁编造外部图片链接，必须直接输出带有 SMIL/CSS 动画的标准 <svg>...</svg> 矢量代码。
 2. 只有明确要求静态写实摄影/插画时，才调用 generate_image 工具出图，拿到链接后以 Markdown 图片语法格式 (![描述](URL)) 嵌入回复。
 3. 涉及当前实时热点、外部资讯时，优先调用 web_search 联网检索。
 4. 调度天气、待办、日历等系统动作时优先调用对应工具。
@@ -1127,31 +539,22 @@ ${skillBlock}${summaryBlock}
     }
   ];
 
-  let totalUsage = { prompt: 0, completion: 0 };
+  const MAX_STEPS = 8;
   let currentStep = 0;
 
   while (currentStep < MAX_STEPS) {
     currentStep++;
-    const usedNote = (totalUsage.prompt + totalUsage.completion) > 0
-      ? ` · 已用 ${totalUsage.prompt + totalUsage.completion} tokens`
-      : "";
-    if (onStatusUpdate) await onStatusUpdate(`第 ${currentStep} 轮自省推理${usedNote}...`);
+    if (onStatusUpdate) await onStatusUpdate(`第 ${currentStep} 轮自省推理中...`);
 
-    const { message, usage } = await callChatAPI(messages, modelCfg, true, 1);
-    if (usage) {
-      totalUsage.prompt += usage.prompt_tokens || 0;
-      totalUsage.completion += usage.completion_tokens || 0;
-    }
-    messages.push(message);
+    const assistantMessage = await callChatAPI(messages);
+    messages.push(assistantMessage);
 
-    if (message.tool_calls && message.tool_calls.length > 0) {
-      for (const call of message.tool_calls) {
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      for (const call of assistantMessage.tool_calls) {
         let fnArgs = {};
         try {
           fnArgs = JSON.parse(call.function.arguments);
-        } catch (e) {
-          fnArgs = { _raw: call.function.arguments };
-        }
+        } catch (e) {}
 
         const toolResult = await executeLocalTool(call.function.name, fnArgs, onStatusUpdate);
         messages.push({
@@ -1161,22 +564,19 @@ ${skillBlock}${summaryBlock}
         });
       }
     } else {
-      const finalReply = message.content || "(无返回内容)";
+      const finalReply = assistantMessage.content || "(无返回内容)";
       await MemoryManager.appendTurn(prompt || "[图片指令]", finalReply);
-      await MemoryManager.addUsage(currentSess.id, totalUsage);
       return finalReply;
     }
   }
 
-  await MemoryManager.addUsage(currentSess.id, totalUsage);
-  return `达到 Mini-Pi 最大自省步数限制 (${MAX_STEPS} 步)。`;
+  return "达到 Mini-Pi 最大自省步数限制。";
 }
-
 // ==========================================
-// 7. 气泡渲染与前端视图 (安全渲染加固)
+// 6. Mini-Pi 气泡渲染与前端视图 (防破损图容错)
 // ==========================================
 function escapeHtml(str) {
-  if (str === null || str === undefined) return "";
+  if (!str) return "";
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -1185,34 +585,79 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
-function buildChatHTML(mem) {
-  const activeSess = mem.sessions.find(s => s.id === mem.active_session_id) || mem.sessions[0];
-  const modelCfg = getActiveModelCfg(mem);
+function renderBubbleContent(text) {
+  if (!text) return "";
 
-  const initial = (activeSess.messages && activeSess.messages.length > 0)
-    ? activeSess.messages.map(h => ({
-        role: h.role === "user" ? "user" : "agent",
-        content: String(h.content || "")
-      }))
-    : [{
-        role: "agent",
-        content: "已就绪。我是你的 Mini-Pi 本地自主 Agent，支持 AI 绘图、在线搜索、天气/日程、截图分析及 SVG 动态渲染。输入 /help 查看全部命令。"
-      }];
-  const initialJson = jsLiteral(initial);
+  // 1. 优先提取并直接渲染原生 SVG 矢量动画
+  const svgMatch = text.match(/<svg[\s\S]*?<\/svg>/i);
+  if (svgMatch) {
+    const rawSvg = svgMatch[0];
+    const nonSvgText = text.replace(rawSvg, "").trim();
+    return `
+      ${nonSvgText ? `<div style="margin-bottom:8px;">${escapeHtml(nonSvgText)}</div>` : ''}
+      <div class="svg-container">${rawSvg}</div>
+    `;
+  }
+
+  // 2. 优化 Markdown 图片渲染，防止蓝色问号破损图
+  const mdImgRegex = /!\[([^\]]*)\]\((https?:\/\/[^\s\)]+)\)/g;
+  let parsed = text;
+  let hasImage = false;
+
+  if (mdImgRegex.test(parsed)) {
+    hasImage = true;
+    parsed = parsed.replace(mdImgRegex, (match, alt, url) => {
+      const cleanUrl = url.trim();
+      return `
+        <div class="image-bubble-card">
+          <img src="${cleanUrl}" alt="${escapeHtml(alt)}" loading="lazy" 
+               onclick="viewFullImage('${cleanUrl}')" 
+               onload="window.scrollToBottom && window.scrollToBottom()" 
+               onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='block';">
+          <div class="image-fallback" style="display:none; padding:12px; text-align:center; color:var(--text-secondary); font-size:12px; background:rgba(0,0,0,0.03);">
+            ⚠️ 图片加载受阻 (${escapeHtml(alt || '外部图片')})
+          </div>
+          ${alt ? `<div class="image-caption">${escapeHtml(alt)}</div>` : ''}
+        </div>
+      `;
+    });
+  }
+
+  if (hasImage) {
+    return parsed;
+  }
+
+  return escapeHtml(text);
+}
+
+function buildChatHTML(mem) {
+  let activeSess = mem.sessions.find(s => s.id === mem.active_session_id) || mem.sessions[0];
+  let bubbles = "";
+  if (!activeSess.messages || activeSess.messages.length === 0) {
+    bubbles = `
+      <div class="msg-row msg-agent">
+        <div class="bubble">已就绪。我是你的 Mini-Pi 本地自主 Agent，支持 AI 绘图、在线搜索、天气/日程、截图分析及 SVG 动态渲染。</div>
+      </div>
+    `;
+  } else {
+    for (const h of activeSess.messages) {
+      const roleCls = h.role === "user" ? "msg-user" : "msg-agent";
+      bubbles += `
+        <div class="msg-row ${roleCls}">
+          <div class="bubble">${renderBubbleContent(h.content)}</div>
+        </div>
+      `;
+    }
+  }
 
   let sessionListHtml = "";
   for (const s of mem.sessions) {
     const isCur = s.id === mem.active_session_id;
     const curCls = isCur ? "session-item active" : "session-item";
-    const turns = Math.floor(((s.messages || []).length) / 2);
-    const when = formatShortTime(s.updated_at || s.created_at);
     sessionListHtml += `
-      <div class="${curCls}" onclick="selectSession('${escapeHtml(s.id)}')">
-        <div class="sess-main">
-          <div class="sess-title">${escapeHtml(s.title || "新会话")}</div>
-          <div class="sess-sub">${turns} 条对话${when ? " · " + escapeHtml(when) : ""}</div>
-        </div>
-        <div class="sess-del" onclick="event.stopPropagation(); deleteSession('${escapeHtml(s.id)}')">✕</div>
+      <div class="${curCls}" onclick="selectSession('${s.id}')">
+        <div class="sess-title">${escapeHtml(s.title || "新会话")}</div>
+        <div class="sess-del" onclick="event.stopPropagation(); deleteSession('${s.id}')">✕</div>
       </div>
     `;
   }
@@ -1265,10 +710,6 @@ function buildChatHTML(mem) {
   .header-btn {
     font-size: 14px; color: var(--user-bubble); background: none; border: none; padding: 4px 6px;
   }
-  .model-tag {
-    font-size: 12px; color: var(--user-bubble);
-    background: var(--item-active); border-radius: 12px; padding: 4px 10px;
-  }
   #chat-container {
     flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px;
   }
@@ -1280,10 +721,7 @@ function buildChatHTML(mem) {
   }
   .msg-user .bubble { background-color: var(--user-bubble); color: #ffffff; border-bottom-right-radius: 4px; }
   .msg-agent .bubble { background-color: var(--agent-bubble); color: var(--text-primary); border-bottom-left-radius: 4px; }
-
-  .md-text { margin-bottom: 6px; }
-  .md-text:last-child { margin-bottom: 0; }
-
+  
   .image-bubble-card {
     margin-top: 6px; border-radius: 12px; overflow: hidden; background: rgba(0,0,0,0.04);
     box-shadow: 0 2px 8px rgba(0,0,0,0.08); display: flex; flex-direction: column;
@@ -1297,7 +735,7 @@ function buildChatHTML(mem) {
 
   .svg-container {
     background: #ffffff; padding: 8px; border-radius: 12px; display: flex; justify-content: center; align-items: center;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.06); max-width: 100%; overflow: hidden; margin-top: 6px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06); max-width: 100%; overflow: hidden;
   }
   .svg-container svg { max-width: 100%; height: auto; display: block; }
   .status-indicator { font-size: 12px; color: var(--text-secondary); margin-top: 4px; padding: 0 4px; }
@@ -1337,12 +775,10 @@ function buildChatHTML(mem) {
     padding: 14px 16px; display: flex; justify-content: space-between; align-items: center;
     border-bottom: 0.5px solid rgba(0,0,0,0.1); font-weight: 600;
   }
-  .drawer-actions { display: flex; gap: 6px; align-items: center; }
   .action-btn {
     background: var(--user-bubble); color: #fff; border: none; border-radius: 14px;
     padding: 6px 12px; font-size: 13px; font-weight: 500;
   }
-  .action-btn.ghost { background: var(--agent-bubble); color: var(--text-primary); }
   .drawer-list {
     flex: 1; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 8px;
   }
@@ -1351,9 +787,7 @@ function buildChatHTML(mem) {
     padding: 10px 12px; border-radius: 10px; font-size: 14px; cursor: pointer;
   }
   .session-item.active { background: var(--item-active); font-weight: 600; }
-  .sess-main { flex: 1; min-width: 0; margin-right: 8px; }
-  .sess-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sess-sub { font-size: 11px; font-weight: 400; color: var(--text-secondary); margin-top: 2px; }
+  .sess-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px; }
   .sess-del { color: var(--text-secondary); font-size: 13px; padding: 4px; }
 
   #image-viewer-mask {
@@ -1363,23 +797,6 @@ function buildChatHTML(mem) {
   #image-viewer-mask img {
     max-width: 100%; max-height: 85vh; border-radius: 8px; object-fit: contain;
   }
-
-  .modal-mask {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200;
-    display: flex; align-items: center; justify-content: center; padding: 24px;
-  }
-  .modal-box {
-    background: var(--card-bg); border-radius: 16px; padding: 10px;
-    width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 6px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.25);
-  }
-  .modal-title { font-weight: 600; font-size: 15px; padding: 6px 10px; }
-  .modal-btn {
-    padding: 12px 10px; border-radius: 10px; border: none;
-    background: var(--bg-color); color: var(--text-primary); font-size: 14px; text-align: left;
-  }
-  .modal-btn:active { opacity: 0.6; }
-  .modal-cancel { color: var(--user-bubble); font-weight: 600; text-align: center; }
 </style>
 </head>
 <body>
@@ -1392,12 +809,8 @@ function buildChatHTML(mem) {
 
 <div id="history-drawer" class="drawer">
   <div class="drawer-header">
-    <span>历史分支 · ${escapeHtml(AGENT_NAME)}</span>
-    <div class="drawer-actions">
-      <button class="action-btn ghost" onclick="postAction('export_session')">导出</button>
-      <button class="action-btn ghost" onclick="postAction('import_session')">导入</button>
-      <button class="action-btn" onclick="postAction('new_session')">+ 新会话</button>
-    </div>
+    <span>历史分支</span>
+    <button class="action-btn" onclick="postAction('new_session')">+ 新会话</button>
   </div>
   <div id="session-list" class="drawer-list">
     ${sessionListHtml}
@@ -1408,22 +821,21 @@ function buildChatHTML(mem) {
   <button class="header-btn" onclick="openHistoryDrawer()">☰ 历史</button>
   <span id="header-title">${escapeHtml(activeSess.title || "Mini-Pi Agent")}</span>
   <div class="header-actions">
-    <button class="header-btn model-tag" onclick="postAction('open_model_picker')">${escapeHtml(modelCfg.label || "模型")}</button>
     <button class="header-btn" onclick="postAction('clear')">清空</button>
   </div>
 </header>
 
 <div id="chat-container">
+  ${bubbles}
 </div>
 
 <footer>
   <button class="icon-btn" onclick="postAction('photo')">📷</button>
-  <input type="text" id="input-box" placeholder="画图、搜资讯、查天气、写待办… 或输入 /help" onkeydown="if(event.key==='Enter') send()">
+  <input type="text" id="input-box" placeholder="画一张图、查天气、搜资讯、写待办..." onkeydown="if(event.key==='Enter') send()">
   <button id="send-btn" onclick="send()">↑</button>
 </footer>
 
 <script>
-  window.__initial = ${initialJson};
   window.__events = [];
   const container = document.getElementById("chat-container");
   const inputBox = document.getElementById("input-box");
@@ -1432,61 +844,6 @@ function buildChatHTML(mem) {
 
   function scrollToBottom() {
     container.scrollTop = container.scrollHeight;
-  }
-
-  function escapeHtml(s) {
-    if (s === null || s === undefined) return "";
-    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-  }
-
-  // SVG 清洗:移除脚本、事件处理器与 javascript: 链接
-  function sanitizeSvg(svg) {
-    return String(svg || "")
-      .replace(/<script[\\s\\S]*?<\\/script>/gi, "")
-      .replace(/\\son\\w+\\s*=\\s*"[^"]*"/gi, "")
-      .replace(/\\son\\w+\\s*=\\s*'[^']*'/gi, "")
-      .replace(/href\\s*=\\s*["']javascript:[^"']*["']/gi, 'href="#"');
-  }
-
-  function imageCard(url, alt) {
-    const u = escapeHtml(url);
-    const a = escapeHtml(alt || "");
-    const onclick = escapeHtml("viewFullImage(" + JSON.stringify(url) + ")");
-    return '<div class="image-bubble-card">' +
-      '<img src="' + u + '" alt="' + a + '" loading="lazy" onclick="' + onclick + '" ' +
-      'onload="window.scrollToBottom && window.scrollToBottom()" ' +
-      'onerror="this.style.display=\\'none\\'; if(this.nextElementSibling) this.nextElementSibling.style.display=\\'block\\';">' +
-      '<div class="image-fallback" style="display:none; padding:12px; text-align:center; color:var(--text-secondary); font-size:12px; background:rgba(0,0,0,0.03);">⚠️ 图片加载受阻 (' + a + ')</div>' +
-      (alt ? '<div class="image-caption">' + a + '</div>' : '') +
-      '</div>';
-  }
-
-  // 安全渲染:文本一律转义,仅图片卡片与清洗后的 SVG 以 HTML 插入
-  function renderBubbleHTML(raw) {
-    const text = String(raw || "");
-    const tokenRe = /<svg[\\s\\S]*?<\\/svg>|!\\[[^\\]]*\\]\\((?:https?:\\/\\/)[^\\s\\)]+\\)/gi;
-    const out = [];
-    let last = 0;
-    let m;
-    while ((m = tokenRe.exec(text)) !== null) {
-      if (m.index > last) {
-        out.push('<div class="md-text">' + escapeHtml(text.slice(last, m.index)) + '</div>');
-      }
-      const tok = m[0];
-      if (tok.charAt(0) === '<') {
-        out.push('<div class="svg-container">' + sanitizeSvg(tok) + '</div>');
-      } else {
-        const imgM = tok.match(/!\\[([^\\]]*)\\]\\(((?:https?:\\/\\/)[^\\s\\)]+)\\)/);
-        if (imgM) out.push(imageCard(imgM[2], imgM[1]));
-      }
-      last = tokenRe.lastIndex;
-    }
-    if (last < text.length) {
-      out.push('<div class="md-text">' + escapeHtml(text.slice(last)) + '</div>');
-    }
-    if (out.length === 0) return escapeHtml(text);
-    return out.join("");
   }
 
   function openHistoryDrawer() {
@@ -1521,55 +878,44 @@ function buildChatHTML(mem) {
     postAction('delete_session', id);
   }
 
-  function openModelPicker(models) {
-    closeAllDrawers();
-    const old = document.getElementById("model-mask");
-    if (old) old.remove();
-    const mmask = document.createElement("div");
-    mmask.id = "model-mask";
-    mmask.className = "modal-mask";
-    const box = document.createElement("div");
-    box.className = "modal-box";
-    const title = document.createElement("div");
-    title.className = "modal-title";
-    title.textContent = "选择模型";
-    box.appendChild(title);
-    (models || []).forEach((m) => {
-      const btn = document.createElement("button");
-      btn.className = "modal-btn";
-      btn.textContent = (m.active ? "✓ " : "") + (m.label || m.id);
-      btn.onclick = () => {
-        const el = document.getElementById("model-mask");
-        if (el) el.remove();
-        postAction('select_model', m.id);
-      };
-      box.appendChild(btn);
-    });
-    const cancel = document.createElement("button");
-    cancel.className = "modal-btn modal-cancel";
-    cancel.textContent = "取消";
-    cancel.onclick = () => {
-      const el = document.getElementById("model-mask");
-      if (el) el.remove();
-    };
-    box.appendChild(cancel);
-    mmask.appendChild(box);
-    mmask.onclick = (e) => {
-      if (e.target === mmask) mmask.remove();
-    };
-    document.body.appendChild(mmask);
-  }
-
   function appendBubble(role, rawContent) {
     const row = document.createElement("div");
-    row.className = "msg-row " + (role === "user" ? "msg-user" : "msg-agent");
+    row.className = "msg-row msg-" + role;
     const b = document.createElement("div");
     b.className = "bubble";
-    if (role === "user") {
-      b.textContent = String(rawContent || "");
+    
+    // 1. 判断 SVG
+    const svgMatch = rawContent.match(/<svg[\\s\\S]*?<\\/svg>/i);
+    if (svgMatch) {
+      const rawSvg = svgMatch[0];
+      const nonSvgText = rawContent.replace(rawSvg, "").trim();
+      if (nonSvgText) {
+        const textNode = document.createElement("div");
+        textNode.style.marginBottom = "8px";
+        textNode.textContent = nonSvgText;
+        b.appendChild(textNode);
+      }
+      const svgBox = document.createElement("div");
+      svgBox.className = "svg-container";
+      svgBox.innerHTML = rawSvg;
+      b.appendChild(svgBox);
     } else {
-      b.innerHTML = renderBubbleHTML(rawContent);
+      // 2. 判断并渲染 Markdown 图片（防破损图容错）
+      const mdImgRegex = /!\\[([^\\]]*)\\]\\((https?:\\/\\/[^\\s\\)]+)\\)/g;
+      if (mdImgRegex.test(rawContent)) {
+        b.innerHTML = rawContent.replace(mdImgRegex, (m, alt, url) => {
+          const cleanUrl = url.trim();
+          return '<div class="image-bubble-card">' +
+            '<img src="' + cleanUrl + '" alt="' + (alt || '') + '" loading="lazy" onclick="viewFullImage(\\'' + cleanUrl + '\\')" onload="scrollToBottom()" onerror="this.style.display=\\'none\\'; if(this.nextElementSibling) this.nextElementSibling.style.display=\\'block\\';">' +
+            '<div class="image-fallback" style="display:none; padding:12px; text-align:center; color:var(--text-secondary); font-size:12px; background:rgba(0,0,0,0.03);">⚠️ 图片加载受阻 (' + (alt || '外部图片') + ')</div>' +
+            (alt ? '<div class="image-caption">' + alt + '</div>' : '') +
+          '</div>';
+        });
+      } else {
+        b.textContent = rawContent;
+      }
     }
+
     row.appendChild(b);
     container.appendChild(row);
     scrollToBottom();
@@ -1604,10 +950,6 @@ function buildChatHTML(mem) {
   }
 
   window.onload = function() {
-    const initial = window.__initial || [];
-    for (let i = 0; i < initial.length; i++) {
-      appendBubble(initial[i].role, initial[i].content);
-    }
     scrollToBottom();
   };
 </script>
@@ -1616,183 +958,7 @@ function buildChatHTML(mem) {
 }
 
 // ==========================================
-// 8. 命令处理与 UI 辅助
-// ==========================================
-// 取出页面里尚未处理的事件(重新加载会重建页面并清空队列,必须先取出再回注)
-async function drainPendingEvents(webView) {
-  try {
-    const raw = await webView.evaluateJavaScript(`
-      (function() {
-        var e = window.__events || [];
-        window.__events = [];
-        return JSON.stringify(e);
-      })()
-    `);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-// 已经生效的结构性事件不回注,避免重复执行;用户输入类事件(text/photo)回注,避免丢失
-const STRUCTURAL_EVENTS = [
-  "new_session", "switch_session", "delete_session", "clear",
-  "select_model", "open_model_picker", "export_session", "import_session"
-];
-
-async function reloadUI(webView) {
-  const pending = await drainPendingEvents(webView);
-  const mem = await MemoryManager.load();
-  await webView.loadHTML(buildChatHTML(mem));
-  const keep = (pending || []).filter(ev => ev && ev.type && STRUCTURAL_EVENTS.indexOf(ev.type) === -1);
-  if (keep.length > 0) {
-    try {
-      await webView.evaluateJavaScript(`window.__events = ${jsLiteral(keep)};`);
-    } catch (e) {}
-  }
-}
-
-async function appendAgentMsg(webView, text) {
-  await webView.evaluateJavaScript(`appendBubble("agent", ${jsLiteral(text)});`);
-}
-
-async function openModelPickerUI(webView, mem) {
-  const list = getActiveModels();
-  const activeId = (mem.settings && mem.settings.model_id) || null;
-  const payload = list.map(m => ({ id: m.id, label: m.label, active: m.id === activeId }));
-  await webView.evaluateJavaScript(`openModelPicker(${jsLiteral(payload)});`);
-}
-
-async function handleSlashCommand(cmd, webView) {
-  const c = String(cmd || "").trim();
-  const mem = await MemoryManager.load();
-
-  if (c === "/help") {
-    await appendAgentMsg(webView,
-      `当前 Agent: ${AGENT_NAME}(数据空间独立)\n` +
-      "可用命令:\n" +
-      "/model    切换模型\n" +
-      "/skills   查看可用技能\n" +
-      "/skill:名称  启用指定技能\n" +
-      "/skill:off   关闭当前技能\n" +
-      "/usage    查看 token 用量\n" +
-      "/storage  查看数据存储与脚本隔离信息\n" +
-      "/export   导出当前会话(写文件+复制剪贴板)\n" +
-      "/import   从剪贴板导入会话 JSON\n" +
-      "/new      新建会话\n" +
-      "/clear    清空当前会话\n" +
-      "/help     显示本帮助");
-    return;
-  }
-
-  if (c === "/model") {
-    await openModelPickerUI(webView, mem);
-    return;
-  }
-
-  if (c === "/skills") {
-    const list = await SkillsManager.listSkills();
-    if (list.length === 0) {
-      await appendAgentMsg(webView, "未发现技能。把 .md 技能文件放入 iCloud 的 " + SKILLS_DIR + " 目录即可注册。\n文件开头支持 name: 与 description: 元数据,正文为完整技能说明。");
-    } else {
-      await appendAgentMsg(webView, "已注册技能:\n" + list.map(s => `- ${s.name}: ${s.description}`).join("\n") + "\n\n用 /skill:名称 启用。");
-    }
-    return;
-  }
-
-  if (c === "/skill:off") {
-    await MemoryManager.setActiveSkill(null);
-    await appendAgentMsg(webView, "已关闭当前技能,回到常规模式。");
-    return;
-  }
-
-  if (c.startsWith("/skill:")) {
-    const name = c.slice(7).trim();
-    if (!name) {
-      await appendAgentMsg(webView, "用法: /skill:技能名");
-      return;
-    }
-    const sk = await SkillsManager.loadSkill(name);
-    if (!sk) {
-      await appendAgentMsg(webView, `未找到技能 "${name}",先输入 /skills 查看列表。`);
-      return;
-    }
-    await MemoryManager.setActiveSkill(sk.name);
-    await appendAgentMsg(webView, `已启用技能: ${sk.name}\n${sk.description}\n\n之后的对话将严格遵循该技能说明。输入 /skill:off 关闭。`);
-    return;
-  }
-
-  if (c === "/storage") {
-    const curSess = mem.sessions.find(s => s.id === mem.active_session_id) || mem.sessions[0];
-    const curTurns = Math.floor((((curSess && curSess.messages) || []).length) / 2);
-    await appendAgentMsg(webView,
-      `Agent 名称: ${AGENT_NAME}\n` +
-      `数据文件: ${memoryFileName()}\n` +
-      `存放位置: iCloud 的 Scriptable 文档目录\n` +
-      `隔离方式: 每个脚本一份文件(按脚本名区分),不同脚本互不干扰\n` +
-      `当前状态: 共 ${mem.sessions.length} 个会话,当前会话 ${curTurns} 轮\n` +
-      `共享方式: 两个脚本填写相同的 AGENT_ID 即可共用同一份记忆`);
-    return;
-  }
-
-  if (c === "/usage") {
-    const sess = mem.sessions.find(s => s.id === mem.active_session_id) || mem.sessions[0];
-    const u = mem.usage || { global: { prompt: 0, completion: 0 }, by_session: {} };
-    const su = (u.by_session && u.by_session[sess.id]) || { prompt: 0, completion: 0 };
-    const turns = Math.floor((sess.messages || []).length / 2);
-    await appendAgentMsg(webView,
-      `本会话: 输入 ${su.prompt} / 输出 ${su.completion} tokens,共 ${turns} 轮\n` +
-      `全局累计: 输入 ${u.global.prompt} / 输出 ${u.global.completion} tokens`);
-    return;
-  }
-
-  if (c === "/export") {
-    try {
-      const r = await MemoryManager.exportSession(mem.active_session_id);
-      await appendAgentMsg(webView, `会话已导出(共 ${r.turns} 轮):\n文件: ${r.fname}(iCloud 文档目录)\n内容已复制到剪贴板。`);
-    } catch (e) {
-      await appendAgentMsg(webView, "导出失败: " + (e.message || e.toString()));
-    }
-    return;
-  }
-
-  if (c === "/import") {
-    try {
-      const text = Pasteboard.pasteString();
-      if (!text || !text.trim()) {
-        await appendAgentMsg(webView, "剪贴板为空。请先复制一份 Mini-Pi 导出的 JSON 再执行 /import。");
-        return;
-      }
-      const copy = await MemoryManager.importSession(text);
-      await reloadUI(webView);
-      await appendAgentMsg(webView, `已导入会话: ${copy.title}(共 ${Math.floor(copy.messages.length / 2)} 轮)`);
-    } catch (e) {
-      await appendAgentMsg(webView, "导入失败: " + (e.message || e.toString()));
-    }
-    return;
-  }
-
-  if (c === "/new") {
-    await MemoryManager.createNewSession();
-    await reloadUI(webView);
-    return;
-  }
-
-  if (c === "/clear") {
-    await MemoryManager.clearCurrentSession();
-    try {
-      await webView.evaluateJavaScript(`
-        document.getElementById("chat-container").innerHTML = '<div class="msg-row msg-agent"><div class="bubble">已清空当前会话记忆。</div></div>';
-      `);
-    } catch (e) {}
-    return;
-  }
-
-  await appendAgentMsg(webView, "未知命令: " + c + ",输入 /help 查看全部命令。");
-}
-
-// ==========================================
-// 9. 双模态分流引擎 (支持截图入参与活跃会话追加)
+// 7. 双模态分流引擎 (支持截图入参与活跃会话追加)
 // ==========================================
 async function main() {
   let externalPrompt = null;
@@ -1844,7 +1010,6 @@ async function main() {
   await webView.loadHTML(buildChatHTML(mem));
 
   let isWindowClosed = false;
-  let jsFailures = 0;
   const presentPromise = webView.present(true).then(() => {
     isWindowClosed = true;
   });
@@ -1865,77 +1030,32 @@ async function main() {
           return JSON.stringify(window.__events.shift());
         })()
       `);
-      jsFailures = 0;
     } catch (e) {
-      // 页面正在重建等瞬时错误不应终止整个界面,连续失败才判定窗口已关闭
-      jsFailures++;
-      if (jsFailures > 20) break;
-      continue;
+      break;
     }
 
     if (!eventRaw) continue;
 
-    let ev;
-    try {
-      ev = JSON.parse(eventRaw);
-    } catch (e) {
-      continue;
-    }
+    const ev = JSON.parse(eventRaw);
 
     if (ev.type === "new_session") {
       await MemoryManager.createNewSession();
-      await reloadUI(webView);
+      const uMem = await MemoryManager.load();
+      await webView.loadHTML(buildChatHTML(uMem));
       continue;
     }
 
     if (ev.type === "switch_session") {
       await MemoryManager.switchSession(ev.data);
-      await reloadUI(webView);
+      const uMem = await MemoryManager.load();
+      await webView.loadHTML(buildChatHTML(uMem));
       continue;
     }
 
     if (ev.type === "delete_session") {
       await MemoryManager.deleteSession(ev.data);
-      await reloadUI(webView);
-      continue;
-    }
-
-    if (ev.type === "open_model_picker") {
       const uMem = await MemoryManager.load();
-      await openModelPickerUI(webView, uMem);
-      continue;
-    }
-
-    if (ev.type === "select_model") {
-      await MemoryManager.setModel(String(ev.data));
-      await reloadUI(webView);
-      continue;
-    }
-
-    if (ev.type === "export_session") {
-      const uMem = await MemoryManager.load();
-      try {
-        const r = await MemoryManager.exportSession(uMem.active_session_id);
-        await appendAgentMsg(webView, `会话已导出(共 ${r.turns} 轮):\n文件: ${r.fname}(iCloud 文档目录)\n内容已复制到剪贴板。`);
-      } catch (e) {
-        await appendAgentMsg(webView, "导出失败: " + (e.message || e.toString()));
-      }
-      continue;
-    }
-
-    if (ev.type === "import_session") {
-      try {
-        const text = Pasteboard.pasteString();
-        if (!text || !text.trim()) {
-          await appendAgentMsg(webView, "剪贴板为空。请先复制一份 Mini-Pi 导出的 JSON 再点击导入。");
-        } else {
-          const copy = await MemoryManager.importSession(text);
-          await reloadUI(webView);
-          await appendAgentMsg(webView, `已导入会话: ${copy.title}(共 ${Math.floor(copy.messages.length / 2)} 轮)`);
-        }
-      } catch (e) {
-        await appendAgentMsg(webView, "导入失败: " + (e.message || e.toString()));
-      }
+      await webView.loadHTML(buildChatHTML(uMem));
       continue;
     }
 
@@ -1950,35 +1070,25 @@ async function main() {
     }
 
     if (ev.type === "text") {
-      const text = String(ev.data || "");
-      if (text.trim().startsWith("/")) {
-        try {
-          await handleSlashCommand(text, webView);
-        } catch (e) {
-          await appendAgentMsg(webView, "命令执行失败: " + (e.message || e.toString()));
-        }
-        continue;
-      }
-
       try {
-        const reply = await runAgentTurn(text, null, async (st) => {
+        const reply = await runAgentTurn(ev.data, null, async (st) => {
           if (!isWindowClosed) {
             try {
-              await webView.evaluateJavaScript(`setStatus(${jsLiteral(st)})`);
+              await webView.evaluateJavaScript(`setStatus(${JSON.stringify(st)})`);
             } catch (e) {}
           }
         });
         if (!isWindowClosed) {
           await webView.evaluateJavaScript(`
             setStatus("");
-            appendBubble("agent", ${jsLiteral(reply)});
+            appendBubble("agent", ${JSON.stringify(reply)});
           `);
         }
       } catch (err) {
         if (!isWindowClosed) {
           await webView.evaluateJavaScript(`
             setStatus("");
-            appendBubble("agent", ${jsLiteral("报错: " + (err.message || err.toString()))});
+            appendBubble("agent", ${JSON.stringify("报错: " + (err.message || err.toString()))});
           `);
         }
       }
@@ -2002,14 +1112,14 @@ async function main() {
         const reply = await runAgentTurn("请分析这张照片", base64, async (st) => {
           if (!isWindowClosed) {
             try {
-              await webView.evaluateJavaScript(`setStatus(${jsLiteral(st)})`);
+              await webView.evaluateJavaScript(`setStatus(${JSON.stringify(st)})`);
             } catch (e) {}
           }
         });
         if (!isWindowClosed) {
           await webView.evaluateJavaScript(`
             setStatus("");
-            appendBubble("agent", ${jsLiteral(reply)});
+            appendBubble("agent", ${JSON.stringify(reply)});
           `);
         }
       } catch (e) {
