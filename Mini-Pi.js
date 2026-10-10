@@ -1,6 +1,15 @@
 // ============================================================
-// Mini-Pi v2.0 — iPhone 上的极简本地自主 Agent
+// Mini-Pi v2.1 — iPhone 上的极简本地自主 Agent
 // 运行环境:Scriptable / aBuddy 等 iOS JS 运行时
+//
+// v2.1 修复(会话隔离与数据安全):
+//  1. 会话 ID 加入随机后缀:同一毫秒创建两个会话不再撞 ID
+//     (撞 ID 会让抽屉里两条记录指向同一会话,表现为"历史相同")
+//  2. 历史数据自愈:加载时自动为重复/缺失的 ID 重新分配
+//  3. 保存时合并磁盘数据 + 写入串行化:多实例/多设备并发不再互相覆盖
+//  4. 重载界面前保留未处理事件:快速连点不再丢操作
+//  5. 抽屉显示每个会话的对话条数与更新时间,便于分辨
+//  6. 主循环容错:瞬时 JS 错误不再直接关闭界面
 //
 // v2.0 优化(相对 v1):
 //  1. 新增 create_calendar_event 工具(补齐 README 承诺的"读写日历")
@@ -50,6 +59,76 @@ function jsLiteral(v) {
   return JSON.stringify(v).replace(/</g, "\\u003c");
 }
 
+// 会话 ID 生成:毫秒时间戳 + 随机后缀,避免同一毫秒内创建两个会话时 ID 撞车
+// (撞车会导致抽屉里出现两条记录指向同一个会话,看起来"历史相同")
+function newSessionId(takenIds) {
+  const taken = takenIds instanceof Set ? takenIds : new Set(takenIds || []);
+  let id;
+  do {
+    id = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+  } while (taken.has(id));
+  return id;
+}
+
+// 历史数据自愈:为重复/缺失的 ID 重新分配,保留各自的独立消息
+function repairDuplicateIds(sessions) {
+  const seen = new Set();
+  const allIds = new Set();
+  for (const s of sessions) {
+    if (s && typeof s === "object" && s.id) allIds.add(s.id);
+  }
+  let changed = false;
+  for (const s of sessions) {
+    if (!s || typeof s !== "object") continue;
+    if (!s.id || seen.has(s.id)) {
+      const taken = new Set([...seen, ...allIds]);
+      s.id = newSessionId(taken);
+      allIds.add(s.id);
+      changed = true;
+    }
+    seen.add(s.id);
+  }
+  return changed;
+}
+
+// 保存时合并磁盘数据:内存里没有、但磁盘上更新的会话(其他实例/其他设备创建的)予以保留
+function mergeSessions(memSessions, diskSessions, lastLoadAt) {
+  const merged = memSessions.slice();
+  const pos = new Map();
+  merged.forEach((s, i) => pos.set(s.id, i));
+  for (const ds of diskSessions || []) {
+    if (!ds || !ds.id) continue;
+    if (!pos.has(ds.id)) {
+      // 内存中不存在:比本次加载更新 = 别处新建的,保留;更旧 = 本实例已删除,丢弃
+      const ts = Date.parse(ds.updated_at || ds.created_at || "") || 0;
+      if (ts > lastLoadAt) {
+        merged.unshift(ds);
+        merged.forEach((s, i) => pos.set(s.id, i));
+      }
+      continue;
+    }
+    // 两边都有:取更新时间较新的版本
+    const idx = pos.get(ds.id);
+    const memTs = Date.parse(merged[idx].updated_at || merged[idx].created_at || "") || 0;
+    const diskTs = Date.parse(ds.updated_at || ds.created_at || "") || 0;
+    if (diskTs > memTs) merged[idx] = ds;
+  }
+  return merged;
+}
+
+function formatShortTime(iso) {
+  const t = Date.parse(iso || "");
+  if (!t) return "";
+  const d = new Date(t);
+  const now = new Date();
+  const pad = n => (n < 10 ? "0" + n : String(n));
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth()
+    && d.getDate() === now.getDate();
+  return sameDay ? `${pad(d.getHours())}:${pad(d.getMinutes())}`
+                 : `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 const MemoryManager = {
   fm: MEM_FM,
 
@@ -58,6 +137,7 @@ const MemoryManager = {
   },
 
   async load() {
+    this._lastLoadAt = Date.now();
     const path = this.memoryPath();
     if (this.fm.fileExists(path)) {
       try {
@@ -68,30 +148,59 @@ const MemoryManager = {
         }
         const data = JSON.parse(this.fm.readString(path));
         if (!data.sessions || data.sessions.length === 0) {
-          const initId = "sess_" + Date.now();
-          data.sessions = [{ id: initId, title: "新会话", created_at: new Date().toISOString(), messages: [] }];
+          const initId = newSessionId();
+          const nowIso = new Date().toISOString();
+          data.sessions = [{ id: initId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }];
           data.active_session_id = initId;
         }
         if (!data.user_profile) data.user_profile = { facts: [] };
         if (!data.usage) data.usage = { global: { prompt: 0, completion: 0 }, by_session: {} };
         if (!data.settings) data.settings = {};
+        // 自愈历史数据:修复重复/缺失的会话 ID(否则两条记录会指向同一份历史)
+        if (repairDuplicateIds(data.sessions)) {
+          try {
+            this.fm.writeString(path, JSON.stringify(data, null, 2));
+          } catch (e) {}
+        }
         return data;
       } catch (e) {}
     }
-    const initId = "sess_" + Date.now();
+    const initId = newSessionId();
+    const nowIso = new Date().toISOString();
     return {
       user_profile: { facts: [] },
       active_session_id: initId,
       settings: {},
       usage: { global: { prompt: 0, completion: 0 }, by_session: {} },
       sessions: [
-        { id: initId, title: "新会话", created_at: new Date().toISOString(), messages: [] }
+        { id: initId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }
       ]
     };
   },
 
+  // 写入串行化 + 合并磁盘上的新数据,避免两个实例/两台设备互相覆盖
   async save(data) {
-    this.fm.writeString(this.memoryPath(), JSON.stringify(data, null, 2));
+    const doWrite = async () => {
+      try {
+        const path = this.memoryPath();
+        if (this.fm.fileExists(path) && this._lastLoadAt) {
+          const diskData = JSON.parse(this.fm.readString(path));
+          if (diskData && Array.isArray(diskData.sessions)) {
+            data.sessions = mergeSessions(data.sessions || [], diskData.sessions, this._lastLoadAt);
+          }
+          // 用量取较大值:既不丢失别处的计数,也不会因重复保存而翻倍
+          if (diskData && diskData.usage && data.usage) {
+            const dg = diskData.usage.global || { prompt: 0, completion: 0 };
+            data.usage.global = data.usage.global || { prompt: 0, completion: 0 };
+            data.usage.global.prompt = Math.max(data.usage.global.prompt || 0, dg.prompt || 0);
+            data.usage.global.completion = Math.max(data.usage.global.completion || 0, dg.completion || 0);
+          }
+        }
+      } catch (e) {}
+      this.fm.writeString(this.memoryPath(), JSON.stringify(data, null, 2));
+    };
+    this._saveChain = (this._saveChain || Promise.resolve()).then(doWrite, doWrite);
+    return this._saveChain;
   },
 
   async appendFact(fact) {
@@ -123,11 +232,13 @@ const MemoryManager = {
 
   async createNewSession() {
     const mem = await this.load();
-    const newId = "sess_" + Date.now();
+    const nowIso = new Date().toISOString();
+    const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
     const newSession = {
       id: newId,
       title: "新会话",
-      created_at: new Date().toISOString(),
+      created_at: nowIso,
+      updated_at: nowIso,
       messages: []
     };
     mem.sessions.unshift(newSession);
@@ -140,8 +251,9 @@ const MemoryManager = {
     const mem = await this.load();
     mem.sessions = mem.sessions.filter(s => s.id !== sessionId);
     if (mem.sessions.length === 0) {
-      const newId = "sess_" + Date.now();
-      mem.sessions = [{ id: newId, title: "新会话", created_at: new Date().toISOString(), messages: [] }];
+      const nowIso = new Date().toISOString();
+      const newId = newSessionId();
+      mem.sessions = [{ id: newId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] }];
       mem.active_session_id = newId;
     } else if (mem.active_session_id === sessionId) {
       mem.active_session_id = mem.sessions[0].id;
@@ -153,8 +265,9 @@ const MemoryManager = {
     const mem = await this.load();
     let sess = mem.sessions.find(s => s.id === mem.active_session_id);
     if (!sess) {
-      const newId = "sess_" + Date.now();
-      sess = { id: newId, title: "新会话", created_at: new Date().toISOString(), messages: [] };
+      const nowIso = new Date().toISOString();
+      const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
+      sess = { id: newId, title: "新会话", created_at: nowIso, updated_at: nowIso, messages: [] };
       mem.sessions.unshift(sess);
       mem.active_session_id = newId;
     }
@@ -165,6 +278,7 @@ const MemoryManager = {
 
     sess.messages.push({ role: "user", content: String(userPrompt) });
     sess.messages.push({ role: "assistant", content: String(assistantReply) });
+    sess.updated_at = new Date().toISOString();
 
     // 兜底截断(正常情况下已由摘要压缩处理,见 compactIfNeeded)
     const cap = HISTORY_TURNS * 2;
@@ -180,6 +294,7 @@ const MemoryManager = {
     if (sess) {
       sess.messages = [];
       sess.title = "新会话";
+      sess.updated_at = new Date().toISOString();
       delete sess.summary;
       await this.save(mem);
     }
@@ -248,11 +363,13 @@ const MemoryManager = {
       throw new Error("JSON 中没有可导入的会话(messages 缺失)");
     }
     const mem = await this.load();
-    const newId = "sess_" + Date.now();
+    const nowIso = new Date().toISOString();
+    const newId = newSessionId(new Set(mem.sessions.map(s => s.id)));
     const copy = {
       id: newId,
       title: sess.title || "导入会话",
-      created_at: new Date().toISOString(),
+      created_at: nowIso,
+      updated_at: nowIso,
       summary: sess.summary || "",
       messages: sess.messages.slice(-HISTORY_TURNS * 2)
     };
@@ -990,10 +1107,15 @@ function buildChatHTML(mem) {
   for (const s of mem.sessions) {
     const isCur = s.id === mem.active_session_id;
     const curCls = isCur ? "session-item active" : "session-item";
+    const turns = Math.floor(((s.messages || []).length) / 2);
+    const when = formatShortTime(s.updated_at || s.created_at);
     sessionListHtml += `
-      <div class="${curCls}" onclick="selectSession('${s.id}')">
-        <div class="sess-title">${escapeHtml(s.title || "新会话")}</div>
-        <div class="sess-del" onclick="event.stopPropagation(); deleteSession('${s.id}')">✕</div>
+      <div class="${curCls}" onclick="selectSession('${escapeHtml(s.id)}')">
+        <div class="sess-main">
+          <div class="sess-title">${escapeHtml(s.title || "新会话")}</div>
+          <div class="sess-sub">${turns} 条对话${when ? " · " + escapeHtml(when) : ""}</div>
+        </div>
+        <div class="sess-del" onclick="event.stopPropagation(); deleteSession('${escapeHtml(s.id)}')">✕</div>
       </div>
     `;
   }
@@ -1132,7 +1254,9 @@ function buildChatHTML(mem) {
     padding: 10px 12px; border-radius: 10px; font-size: 14px; cursor: pointer;
   }
   .session-item.active { background: var(--item-active); font-weight: 600; }
-  .sess-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px; }
+  .sess-main { flex: 1; min-width: 0; margin-right: 8px; }
+  .sess-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess-sub { font-size: 11px; font-weight: 400; color: var(--text-secondary); margin-top: 2px; }
   .sess-del { color: var(--text-secondary); font-size: 13px; padding: 4px; }
 
   #image-viewer-mask {
@@ -1397,9 +1521,38 @@ function buildChatHTML(mem) {
 // ==========================================
 // 8. 命令处理与 UI 辅助
 // ==========================================
+// 取出页面里尚未处理的事件(重新加载会重建页面并清空队列,必须先取出再回注)
+async function drainPendingEvents(webView) {
+  try {
+    const raw = await webView.evaluateJavaScript(`
+      (function() {
+        var e = window.__events || [];
+        window.__events = [];
+        return JSON.stringify(e);
+      })()
+    `);
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// 已经生效的结构性事件不回注,避免重复执行;用户输入类事件(text/photo)回注,避免丢失
+const STRUCTURAL_EVENTS = [
+  "new_session", "switch_session", "delete_session", "clear",
+  "select_model", "open_model_picker", "export_session", "import_session"
+];
+
 async function reloadUI(webView) {
+  const pending = await drainPendingEvents(webView);
   const mem = await MemoryManager.load();
   await webView.loadHTML(buildChatHTML(mem));
+  const keep = (pending || []).filter(ev => ev && ev.type && STRUCTURAL_EVENTS.indexOf(ev.type) === -1);
+  if (keep.length > 0) {
+    try {
+      await webView.evaluateJavaScript(`window.__events = ${jsLiteral(keep)};`);
+    } catch (e) {}
+  }
 }
 
 async function appendAgentMsg(webView, text) {
@@ -1579,6 +1732,7 @@ async function main() {
   await webView.loadHTML(buildChatHTML(mem));
 
   let isWindowClosed = false;
+  let jsFailures = 0;
   const presentPromise = webView.present(true).then(() => {
     isWindowClosed = true;
   });
@@ -1599,13 +1753,22 @@ async function main() {
           return JSON.stringify(window.__events.shift());
         })()
       `);
+      jsFailures = 0;
     } catch (e) {
-      break;
+      // 页面正在重建等瞬时错误不应终止整个界面,连续失败才判定窗口已关闭
+      jsFailures++;
+      if (jsFailures > 20) break;
+      continue;
     }
 
     if (!eventRaw) continue;
 
-    const ev = JSON.parse(eventRaw);
+    let ev;
+    try {
+      ev = JSON.parse(eventRaw);
+    } catch (e) {
+      continue;
+    }
 
     if (ev.type === "new_session") {
       await MemoryManager.createNewSession();
